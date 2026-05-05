@@ -1,0 +1,22 @@
+{
+  "_comment": "MCP servers for this project. Rename to .mcp.json when ready. Commit this file so the team shares server definitions. Secrets come from environment variables, not this file.",
+  "mcpServers": {
+    "postgres": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres", "${DATABASE_URL}"]
+    },
+    "clickup": {
+      "_comment": "Official ClickUp MCP server or a community one. Verify source before enabling.",
+      "command": "npx",
+      "args": ["-y", "@hauptsache.net/clickup-mcp"],
+      "env": {
+        "CLICKUP_API_TOKEN": "${CLICKUP_API_TOKEN}",
+        "CLICKUP_TEAM_ID": "${CLICKUP_TEAM_ID}"
+      }
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "${PWD}/docs", "${PWD}/prompts"]
+    }
+  }
+}

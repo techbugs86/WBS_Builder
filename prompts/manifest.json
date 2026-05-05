@@ -1,0 +1,53 @@
+{
+  "schema_version": "1",
+  "stages": {
+    "brief_extraction": {
+      "current": null,
+      "versions": [
+        {
+          "version": 1,
+          "file": "brief_extraction/v1.md",
+          "status": "draft",
+          "created_at": "2026-04-20",
+          "notes": "Initial production version. Adds refusal clause, anti-patterns, two few-shot examples (happy path + vague/refusal-triggered). Aligns to BriefSchema in apps/api/src/ai/index.ts."
+        }
+      ]
+    },
+    "epic_generation": {
+      "current": null,
+      "versions": [
+        {
+          "version": 1,
+          "file": "epic_generation/v1.md",
+          "status": "draft",
+          "created_at": "2026-04-20",
+          "notes": "Initial production version. Enforces domain enum, Fibonacci storyPoints, blocked-epic pattern. Two few-shot examples (full example + blocked epic stub)."
+        }
+      ]
+    },
+    "journey_generation": {
+      "current": null,
+      "versions": [
+        {
+          "version": 1,
+          "file": "journey_generation/v1.md",
+          "status": "draft",
+          "created_at": "2026-04-20",
+          "notes": "Initial production version. Enforces step format [Actor]: [action], coverage requirement (happy path, validation failure, system error, empty state, loading state). Two few-shot examples (complex multi-step booking + simple notification journey)."
+        }
+      ]
+    },
+    "task_decomposition": {
+      "current": null,
+      "versions": [
+        {
+          "version": 1,
+          "file": "task_decomposition/v1.md",
+          "status": "draft",
+          "created_at": "2026-04-20",
+          "notes": "Initial production version. Enforces GWT AC format, banned words, 4-16h estimate bounds, split-by-layer heuristic. Three few-shot examples (backend endpoint, frontend component, integration/webhook)."
+        }
+      ]
+    }
+  }
+}
