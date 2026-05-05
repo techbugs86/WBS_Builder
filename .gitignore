@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+.venv/
+__pycache__/
+*.pyc
+
+# Build
+dist/
+build/
+.next/
+.turbo/
+
+# Env & secrets
+.env
+.env.test
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+# Claude
+.claude/settings.local.json
+.claude/.credentials.json
+.claude-dev-helper/
+
+# MCP
+.mcp.local.json
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# Test & coverage
+coverage/
+.nyc_output/
+.pytest_cache/
+.ruff_cache/

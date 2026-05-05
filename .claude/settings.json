@@ -1,0 +1,71 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(npm test *)",
+      "Bash(pnpm install *)",
+      "Bash(pnpm run *)",
+      "Bash(uv *)",
+      "Bash(uv pip install *)",
+      "Bash(uv run *)",
+      "Bash(python -m pytest *)",
+      "Bash(pytest *)",
+      "Bash(ruff *)",
+      "Bash(pyright *)",
+      "Bash(tsc *)",
+      "Bash(eslint *)",
+      "Bash(prettier *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git branch *)",
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(psql *)",
+      "Bash(docker compose *)",
+      "Bash(docker ps)",
+      "Bash(docker logs *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(find *)",
+      "Bash(curl http://localhost*)",
+      "Bash(curl http://127.0.0.1*)",
+      "Read(//*)",
+      "Write(//*)",
+      "Edit(//*)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(npm publish*)",
+      "Bash(curl https://api.clickup.com*)",
+      "Bash(curl https://api.anthropic.com*)",
+      "Read(/.env)",
+      "Read(/.env.*)",
+      "Read(/**/.env)",
+      "Read(/**/.env.*)",
+      "Read(/**/secrets/**)",
+      "Read(/**/*.pem)",
+      "Read(/**/*.key)"
+    ],
+    "ask": [
+      "Bash(git push *)",
+      "Bash(npm install * --save)",
+      "Bash(pnpm add *)",
+      "Bash(uv add *)",
+      "Bash(docker compose down*)",
+      "Bash(psql * -c DROP*)",
+      "Bash(psql * -c TRUNCATE*)"
+    ]
+  },
+  "env": {
+    "NODE_ENV": "development",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}

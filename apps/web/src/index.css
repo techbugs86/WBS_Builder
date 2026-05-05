@@ -1,0 +1,192 @@
+@import "tailwindcss";
+
+/* ─── Dark theme (default) ───────────────────────────────────────────────── */
+:root,
+[data-theme="dark"] {
+  --bg: #080810;
+  --bg-card: #0f0f1a;
+  --bg-card-alt: #0c0c16;
+  --bg-elevated: #16162a;
+  --bg-sidebar: #09090f;
+  --bg-sidebar-end: #09090f;
+  --bg-deep: #07070f;
+  --bg-overlay: rgba(255, 255, 255, 0.03);
+  --bg-overlay-md: rgba(255, 255, 255, 0.04);
+  --bg-input: #0b0b15;
+
+  --border: #1e1e2e;
+  --border-subtle: #1a1a2e;
+  --border-dim: #13131f;
+  --border-dashed: #2a2a4a;
+
+  --text-primary: #f0f0ff;
+  --text-dimmer: #d0d0f0;
+  --text-secondary: #a8a8c0;
+  --text-muted: #60607a;
+  --text-dim: #40405a;
+
+  --accent: #7c3aed;
+  --accent-light: #8b5cf6;
+  --accent-glow: rgba(124, 58, 237, 0.18);
+  --accent-text: #9333ea;
+  --accent-text-dim: #a855f7;
+  --success: #10b981;
+  --success-text: #34d399;
+  --success-bg: rgba(16,185,129,0.08);
+  --success-border: rgba(16,185,129,0.25);
+  --warning: #f59e0b;
+  --warning-text: #fbbf24;
+  --warning-bg: rgba(245,158,11,0.08);
+  --warning-border: rgba(245,158,11,0.25);
+  --error: #ef4444;
+  --error-text: #f87171;
+  --error-bg: rgba(239,68,68,0.08);
+  --error-border: rgba(239,68,68,0.25);
+
+  --scrollbar: #2a2a40;
+  --scrollbar-hover: #3a3a55;
+  --selection-bg: rgba(124, 58, 237, 0.35);
+
+  color-scheme: dark;
+}
+
+/* ─── Light theme ────────────────────────────────────────────────────────── */
+[data-theme="light"] {
+  --bg: #f4f4f8;
+  --bg-card: #ffffff;
+  --bg-card-alt: #f8f8fc;
+  --bg-elevated: #eeeef5;
+  --bg-sidebar: #f0f0f7;
+  --bg-sidebar-end: #eaeaf2;
+  --bg-deep: #f0f0f5;
+  --bg-overlay: rgba(0, 0, 0, 0.03);
+  --bg-overlay-md: rgba(0, 0, 0, 0.04);
+  --bg-input: #f0f0f8;
+
+  --border: #d8d8e8;
+  --border-subtle: #e4e4f0;
+  --border-dim: #ebebf5;
+  --border-dashed: #c8c8dc;
+
+  --text-primary: #111128;
+  --text-dimmer: #2a2a50;
+  --text-secondary: #4a4a6a;
+  --text-muted: #7070a0;
+  --text-dim: #9090b8;
+
+  --accent: #7c3aed;
+  --accent-light: #8b5cf6;
+  --accent-glow: rgba(124, 58, 237, 0.12);
+  --accent-text: #6d28d9;
+  --accent-text-dim: #7c3aed;
+  --success: #059669;
+  --success-text: #047857;
+  --success-bg: rgba(5,150,105,0.08);
+  --success-border: rgba(5,150,105,0.25);
+  --warning: #d97706;
+  --warning-text: #b45309;
+  --warning-bg: rgba(217,119,6,0.08);
+  --warning-border: rgba(217,119,6,0.25);
+  --error: #dc2626;
+  --error-text: #b91c1c;
+  --error-bg: rgba(220,38,38,0.08);
+  --error-border: rgba(220,38,38,0.25);
+
+  --scrollbar: #c0c0d8;
+  --scrollbar-hover: #a0a0c0;
+  --selection-bg: rgba(124, 58, 237, 0.2);
+
+  color-scheme: light;
+}
+
+/* ─── Base ───────────────────────────────────────────────────────────────── */
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Subtle noise/grain texture */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 128px 128px;
+}
+
+/* Ambient glow top-right */
+body::after {
+  content: '';
+  position: fixed;
+  top: -200px;
+  right: -200px;
+  width: 600px;
+  height: 600px;
+  background: radial-gradient(circle, rgba(109, 40, 217, 0.06) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-hover);
+}
+
+/* Selection */
+::selection {
+  background: var(--selection-bg);
+  color: var(--text-primary);
+}
+
+/* ─── Form element baseline ─────────────────────────────────────────────── */
+/* Light bg + dark text on every input/textarea/select by default.          */
+/* Inline styles that set background/color will override this as needed.    */
+
+input,
+textarea,
+select {
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border-color: var(--border);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-dim);
+}
+
+/* Date/time picker chrome inherits the active color-scheme automatically */
+input[type="date"],
+input[type="time"],
+input[type="datetime-local"] {
+  color-scheme: inherit;
+}
+
+/* Card hover */
+.card-hover:hover {
+  box-shadow: 0 0 0 1px rgba(124, 58, 237, 0.2), 0 4px 24px rgba(0, 0, 0, 0.4);
+}
