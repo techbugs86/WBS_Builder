@@ -12,6 +12,8 @@ import {
   LayoutGrid,
   Sparkles,
   Trash2,
+  Search,
+  X,
 } from 'lucide-react';
 import { useProjectStore } from '../store/useProjectStore';
 import { Button } from '../components/ui/button';
@@ -171,14 +173,42 @@ export function ProjectsPage() {
   const deleteProject = useProjectStore((s) => s.deleteProject);
   const currentUser = useProjectStore((s) => s.currentUser);
 
-  const canDelete = currentUser?.role === 'admin' || currentUser?.role === 'owner';
+  // All authenticated org members can delete — see middleware/requireRole.ts
+  const canDelete = Boolean(currentUser);
   const [pendingDelete, setPendingDelete] = useState<SavedProject | null>(null);
+
+  // Client-side search + status filter. We deliberately don't paginate
+  // server-side: agencies typically have <100 projects total, so fetching
+  // everything once and filtering in-memory is faster + simpler than
+  // round-tripping for every keystroke.
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<'all' | SavedProject['status']>('all');
 
   useEffect(() => { void loadProjects(); }, [loadProjects]);
 
   const totalTasks = savedProjects.reduce((sum, p) => sum + p.taskCount, 0);
   const totalSynced = savedProjects.reduce((sum, p) => sum + p.syncedCount, 0);
   const activeProjects = savedProjects.filter((p) => p.status !== 'draft').length;
+
+  const searchLower = search.trim().toLowerCase();
+  const filteredProjects = savedProjects.filter((p) => {
+    if (statusFilter !== 'all' && p.status !== statusFilter) return false;
+    if (!searchLower) return true;
+    return (
+      p.name.toLowerCase().includes(searchLower) ||
+      p.client.toLowerCase().includes(searchLower)
+    );
+  });
+
+  // Counts per status (for filter pill badges). Computed off the unfiltered
+  // list so the user can see "Synced (3)" before filtering down to it.
+  const statusCounts = {
+    all: savedProjects.length,
+    draft: savedProjects.filter((p) => p.status === 'draft').length,
+    in_review: savedProjects.filter((p) => p.status === 'in_review').length,
+    approved: savedProjects.filter((p) => p.status === 'approved').length,
+    synced: savedProjects.filter((p) => p.status === 'synced').length,
+  } as const;
 
   const stats = [
     { label: 'Total Projects', value: savedProjects.length, icon: FolderOpen, color: 'var(--accent-text)', glow: 'rgba(124,58,237,0.12)' },
@@ -242,8 +272,77 @@ export function ProjectsPage() {
           ))}
         </div>
 
+        {/* Search + status filter bar — only shown when there's something to filter.
+            Search matches project name OR client name (case-insensitive).
+            Status pills act like quick filters with live counts. */}
+        {savedProjects.length > 0 && (
+          <div className="flex items-center gap-3 mb-5 flex-wrap">
+            {/* Status pills */}
+            <div
+              className="flex items-center gap-1 rounded-lg p-1"
+              style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border)' }}
+            >
+              {([
+                { value: 'all',       label: 'All' },
+                { value: 'draft',     label: 'Draft' },
+                { value: 'in_review', label: 'In Review' },
+                { value: 'approved',  label: 'Approved' },
+                { value: 'synced',    label: 'Synced' },
+              ] as const).map((tab) => (
+                <button
+                  key={tab.value}
+                  onClick={() => setStatusFilter(tab.value)}
+                  className="px-3 py-1.5 rounded-md text-xs font-medium transition-all duration-150 cursor-pointer flex items-center gap-1.5"
+                  style={statusFilter === tab.value ? {
+                    background: 'rgba(124,58,237,0.15)', color: 'var(--accent-text)', border: '1px solid rgba(124,58,237,0.3)',
+                  } : { color: 'var(--text-muted)', border: '1px solid transparent' }}
+                >
+                  {tab.label}
+                  <span
+                    className="text-[10px] font-mono px-1 rounded"
+                    style={{
+                      background: statusFilter === tab.value ? 'rgba(124,58,237,0.25)' : 'var(--bg-overlay-md)',
+                      color: statusFilter === tab.value ? 'var(--accent-text)' : 'var(--text-dim)',
+                    }}
+                  >
+                    {statusCounts[tab.value]}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            {/* Search */}
+            <div className="relative flex-1 min-w-[200px] max-w-md">
+              <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2" style={{ color: 'var(--text-dim)' }} />
+              <input
+                type="text"
+                placeholder="Search by project or client name…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="w-full pl-9 pr-9 py-2 rounded-lg text-xs placeholder-[var(--text-dim)] focus:outline-none focus:ring-2 focus:ring-violet-500"
+                style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border)', color: 'var(--text-primary)' }}
+              />
+              {search && (
+                <button
+                  onClick={() => setSearch('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded hover:bg-white/5"
+                  style={{ color: 'var(--text-dim)' }}
+                  aria-label="Clear search"
+                >
+                  <X size={12} />
+                </button>
+              )}
+            </div>
+
+            <span className="text-xs shrink-0" style={{ color: 'var(--text-muted)' }}>
+              {filteredProjects.length} of {savedProjects.length}
+            </span>
+          </div>
+        )}
+
         {/* Project grid */}
         {savedProjects.length === 0 ? (
+          // No projects exist at all — first-time state
           <div className="flex flex-col items-center justify-center py-24 text-center">
             <div
               className="w-14 h-14 rounded-full flex items-center justify-center mb-4"
@@ -258,9 +357,32 @@ export function ProjectsPage() {
               New Project
             </Button>
           </div>
+        ) : filteredProjects.length === 0 ? (
+          // Projects exist but the current filter excludes all of them
+          <div className="flex flex-col items-center justify-center py-16 text-center">
+            <div
+              className="w-12 h-12 rounded-full flex items-center justify-center mb-3"
+              style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border)' }}
+            >
+              <Search size={18} style={{ color: 'var(--text-dim)' }} />
+            </div>
+            <p className="text-sm font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>No projects match your filters</p>
+            <p className="text-xs mb-4" style={{ color: 'var(--text-muted)' }}>
+              Try adjusting the search term or status filter.
+            </p>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => { setSearch(''); setStatusFilter('all'); }}
+              className="gap-1.5"
+            >
+              <X size={12} />
+              Clear filters
+            </Button>
+          </div>
         ) : (
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
-            {savedProjects.map((project, i) => (
+            {filteredProjects.map((project, i) => (
               <ProjectCard
                 key={project.id}
                 project={project}

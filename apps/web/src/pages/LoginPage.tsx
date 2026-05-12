@@ -26,11 +26,17 @@ export function LoginPage() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setIsLoading(true);
-    await login(email, password);
-    setIsLoading(false);
-    // Navigate only if login succeeded (no authError will be set)
-    const user = useProjectStore.getState().currentUser;
-    if (user) navigate('/projects', { replace: true });
+    try {
+      // login() throws on failure; only navigate when it resolves successfully.
+      // Don't infer success from currentUser (which can be stale from a prior
+      // session in localStorage) — that's how we accidentally let bad creds in.
+      await login(email, password);
+      navigate('/projects', { replace: true });
+    } catch {
+      // authError is set inside the store; the form below renders it.
+    } finally {
+      setIsLoading(false);
+    }
   }
 
   function fillDemo(e: React.MouseEvent, demoEmail: string, demoPassword: string) {
@@ -78,18 +84,22 @@ export function LoginPage() {
           <h1 className="text-lg font-bold mb-1" style={{ color: 'var(--text-primary)' }}>Sign in</h1>
           <p className="text-xs mb-6" style={{ color: 'var(--text-muted)' }}>Access the WBS pipeline</p>
 
-          <form onSubmit={handleSubmit} className="space-y-4">
+          {/* autoComplete="off" on the form, plus per-field overrides below,
+              prevents browsers from pre-filling saved credentials. We want
+              the user to type fresh credentials on every visit. */}
+          <form onSubmit={handleSubmit} className="space-y-4" autoComplete="off">
             <div>
               <label className="block text-xs font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--text-secondary)' }}>
                 Email
               </label>
               <input
                 type="email"
+                name="wbs-email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                placeholder="you@wbs.io"
+                placeholder="Enter your email"
                 required
-                autoComplete="email"
+                autoComplete="off"
                 className={inputCls}
                 style={inputStyle}
               />
@@ -102,11 +112,16 @@ export function LoginPage() {
               <div className="relative">
                 <input
                   type={showPassword ? 'text' : 'password'}
+                  name="wbs-password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
+                  placeholder="Enter your password"
                   required
-                  autoComplete="current-password"
+                  // 'new-password' tells most browsers this is a registration
+                  // field, suppressing the saved-password autofill. Trade-off:
+                  // browser won't offer to save it after login, but that's OK
+                  // for an internal tool with demo creds shown below.
+                  autoComplete="new-password"
                   className={inputCls}
                   style={{ ...inputStyle, paddingRight: '2.75rem' }}
                 />

@@ -39,6 +39,22 @@ export interface RegenState {
   lastError: string | null;
 }
 
+/**
+ * Cascade-prompt state — set immediately after a brief challenge succeeds when
+ * the project already has downstream artifacts. The Brief page renders a
+ * confirm dialog from this state offering to regenerate epics → journeys →
+ * tasks (with the same challenge text). Cleared by user action.
+ */
+export interface CascadePromptState {
+  open: boolean;
+  /** Original challenge text the user submitted on the brief — passed to downstream stages. */
+  challengeText: string;
+  /** Counts before cascade so the dialog can show "this will replace 7 epics, 22 journeys, 100 tasks". */
+  counts: { epics: number; journeys: number; tasks: number };
+  /** Currently-running stage during cascade execution; null when idle. */
+  runningStage: 'epics' | 'journeys' | 'tasks' | null;
+}
+
 interface ProjectState {
   // Active project
   activeProjectId: string | null;
@@ -52,6 +68,7 @@ interface ProjectState {
 
   // Regen / challenge AI state
   regenState: RegenState;
+  cascadePrompt: CascadePromptState;
 
   // Projects list
   savedProjects: SavedProject[];
@@ -80,6 +97,7 @@ interface ProjectState {
   updateEpic: (id: string, fields: { title?: string; description?: string; storyPoints?: number; domain?: Domain }) => Promise<void>;
   approveAllEpics: () => Promise<void>;
   deleteAllEpics: () => Promise<void>;
+  deleteEpic: (epicKey: string) => Promise<void>;
   restoreEpicVersion: (epicKey: string, version: number) => Promise<void>;
 
   // Actions — journeys
@@ -87,6 +105,7 @@ interface ProjectState {
   updateJourney: (id: string, fields: { title?: string; persona?: string; happyPath?: string; steps?: string[]; edgeCasesCount?: number }) => Promise<void>;
   approveAllJourneys: () => Promise<void>;
   deleteAllJourneys: () => Promise<void>;
+  deleteJourney: (journeyKey: string) => Promise<void>;
   restoreJourneyVersion: (journeyKey: string, version: number) => Promise<void>;
 
   // Actions — tasks
@@ -94,6 +113,7 @@ interface ProjectState {
   updateTask: (id: string, fields: { title?: string; estimateHours?: number }) => Promise<void>;
   approveAllTasks: () => Promise<void>;
   deleteAllTasks: () => Promise<void>;
+  deleteTask: (taskKey: string) => Promise<void>;
   restoreTaskVersion: (taskKey: string, version: number) => Promise<void>;
 
   // Rewrite single item via prompt
@@ -102,6 +122,11 @@ interface ProjectState {
   // Challenge AI (re-generate entire stage)
   challengeAI: (stage: string, text: string) => Promise<void>;
   clearRegenState: () => void;
+
+  // Cascade after brief challenge — regenerate epics → journeys → tasks with the
+  // same challenge text. Only invoked when user accepts the cascade dialog.
+  cascadeRegen: () => Promise<void>;
+  dismissCascadePrompt: () => void;
 
   // Projects API
   loadProjects: () => Promise<void>;
@@ -125,7 +150,7 @@ interface ProjectState {
   currentUser: AppUser | null;
   authError: string | null;
   login: (email: string, password: string) => Promise<void>;
-  logout: () => void;
+  logout: () => Promise<void>;
 
   // Prompt configs
   promptConfigs: PromptConfig[];
@@ -149,6 +174,13 @@ const INITIAL_REGEN_STATE: RegenState = {
   challengeText: '',
   diffSummary: '',
   lastError: null,
+};
+
+const INITIAL_CASCADE_PROMPT: CascadePromptState = {
+  open: false,
+  challengeText: '',
+  counts: { epics: 0, journeys: 0, tasks: 0 },
+  runningStage: null,
 };
 
 const EMPTY_BRIEF: BriefWithHistory = {
@@ -190,6 +222,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   journeys: [],
   tasks: [],
   regenState: INITIAL_REGEN_STATE,
+  cascadePrompt: INITIAL_CASCADE_PROMPT,
   savedProjects: [],
   isLoadingProjects: false,
   isLoadingProject: false,
@@ -376,6 +409,24 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     await get().loadProjects();
   },
 
+  deleteEpic: async (epicKey) => {
+    const pid = get().activeProjectId;
+    if (!pid) throw new Error('No active project.');
+    await api.del(`/projects/${pid}/epics/${epicKey}`);
+    // Cascade in-memory: drop the epic AND any journeys / tasks under it.
+    // Backend already cascaded — we're just keeping the UI in sync.
+    set((state) => {
+      const epicId = epicKey; // epic_key === epic.current.id (the UUID)
+      const journeysOfEpic = state.journeys.filter((j) => j.current.epicId === epicId).map((j) => j.current.id);
+      return {
+        epics:    state.epics.filter((e) => e.current.id !== epicId),
+        journeys: state.journeys.filter((j) => j.current.epicId !== epicId),
+        tasks:    state.tasks.filter((t) => t.current.epicId !== epicId && !journeysOfEpic.includes(t.current.journeyId)),
+      };
+    });
+    await get().loadProjects();
+  },
+
   restoreEpicVersion: async (epicKey, version) => {
     const pid = get().activeProjectId;
     if (!pid) return;
@@ -454,6 +505,21 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     await api.del(`/projects/${pid}/journeys`);
     // Cascade: deleting journeys also wipes tasks (tasks reference journeys).
     set({ journeys: [], tasks: [] });
+    await get().loadProjects();
+  },
+
+  deleteJourney: async (journeyKey) => {
+    const pid = get().activeProjectId;
+    if (!pid) throw new Error('No active project.');
+    await api.del(`/projects/${pid}/journeys/${journeyKey}`);
+    // Cascade in-memory: drop the journey AND any tasks under it.
+    set((state) => {
+      const journeyId = journeyKey;
+      return {
+        journeys: state.journeys.filter((j) => j.current.id !== journeyId),
+        tasks:    state.tasks.filter((t) => t.current.journeyId !== journeyId),
+      };
+    });
     await get().loadProjects();
   },
 
@@ -537,6 +603,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     if (!pid) throw new Error('No active project.');
     await api.del(`/projects/${pid}/tasks`);
     set({ tasks: [] });
+    await get().loadProjects();
+  },
+
+  deleteTask: async (taskKey) => {
+    const pid = get().activeProjectId;
+    if (!pid) throw new Error('No active project.');
+    await api.del(`/projects/${pid}/tasks/${taskKey}`);
+    set((state) => ({ tasks: state.tasks.filter((t) => t.current.id !== taskKey) }));
     await get().loadProjects();
   },
 
@@ -663,6 +737,22 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         set((state) => ({
           regenState: { ...state.regenState, affectedIds: ['brief'], diffSummary: 'Brief regenerated' },
         }));
+        // If downstream stages exist, offer to cascade-regenerate them so they
+        // reflect the new brief content. Without this, the brief drifts out of
+        // sync with epics/journeys/tasks until the user manually regens each.
+        const epicsCount = get().epics.length;
+        const journeysCount = get().journeys.length;
+        const tasksCount = get().tasks.length;
+        if (epicsCount + journeysCount + tasksCount > 0) {
+          set({
+            cascadePrompt: {
+              open: true,
+              challengeText: text,
+              counts: { epics: epicsCount, journeys: journeysCount, tasks: tasksCount },
+              runningStage: null,
+            },
+          });
+        }
       } else if (stage === 'epics') {
         await get().generateEpics(pid, text);
         const after = get().epics;
@@ -723,6 +813,74 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   clearRegenState: () => set({ regenState: INITIAL_REGEN_STATE }),
+
+  dismissCascadePrompt: () => set({ cascadePrompt: INITIAL_CASCADE_PROMPT }),
+
+  cascadeRegen: async () => {
+    const pid = get().activeProjectId;
+    const { challengeText } = get().cascadePrompt;
+    if (!pid) {
+      set({ appError: 'No active project — cannot cascade regenerate.' });
+      return;
+    }
+
+    // Sequential, not parallel — each stage depends on the previous one's
+    // output. We update runningStage as we go so the dialog shows progress.
+    //
+    // generate* actions swallow errors and set appError internally rather than
+    // throwing. So `await` returns "success" even when the stage actually
+    // failed. We detect failure by snapshotting appError before each stage
+    // and aborting if a new error message appears after the call.
+    const errorBefore = get().appError;
+    const stages = [
+      { name: 'epics' as const, fn: () => get().generateEpics(pid, challengeText) },
+      { name: 'journeys' as const, fn: () => get().generateJourneys(pid, challengeText) },
+      { name: 'tasks' as const, fn: () => get().generateTasks(pid, challengeText) },
+    ];
+
+    for (const stage of stages) {
+      set((s) => ({ cascadePrompt: { ...s.cascadePrompt, runningStage: stage.name } }));
+      const errorBeforeStage = get().appError;
+      try {
+        await stage.fn();
+      } catch (err) {
+        // Belt-and-braces — a future generate* may legitimately throw.
+        const msg = err instanceof Error ? err.message : `${stage.name} generation threw.`;
+        set({
+          appError: `Cascade failed at "${stage.name}" stage: ${msg}`,
+          cascadePrompt: INITIAL_CASCADE_PROMPT,
+        });
+        return;
+      }
+      // The generate* action set appError silently — abort the cascade so the
+      // user sees a clear "stopped at X" error rather than three identical
+      // errors flickering as each subsequent stage also fails.
+      const errorAfterStage = get().appError;
+      if (errorAfterStage && errorAfterStage !== errorBeforeStage) {
+        set({
+          appError: `Cascade stopped at "${stage.name}" stage. ${errorAfterStage}`,
+          cascadePrompt: INITIAL_CASCADE_PROMPT,
+        });
+        // Even on partial-success failure, refresh the project list so any
+        // stages that DID complete show their new counts.
+        await get().loadProjects();
+        return;
+      }
+    }
+
+    // All three stages completed cleanly — clear the dialog and any pre-existing
+    // error message that's now stale.
+    set({
+      cascadePrompt: INITIAL_CASCADE_PROMPT,
+      appError: errorBefore && get().appError === errorBefore ? errorBefore : null,
+    });
+
+    // Refresh savedProjects so the project list / sidebar card counts reflect
+    // the new state. Without this, the list page would keep showing the
+    // pre-cascade epicCount/taskCount/syncedCount until the next manual reload.
+    // Mirrors the same refresh pattern used after sync completes.
+    await get().loadProjects();
+  },
 
   // ─── Projects API ──────────────────────────────────────────────────────────
 
@@ -1033,11 +1191,45 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       localStorage.setItem('wbs_user', JSON.stringify(res.user));
       set({ currentUser: res.user, authError: null });
     } catch (err) {
-      set({ authError: err instanceof Error ? err.message : 'Login failed.' });
+      // Defensive: a failed login MUST wipe any stale session left in
+      // localStorage. Without this, a user who refreshes after logout (without
+      // localStorage being cleared) and types the wrong password would still
+      // be "logged in" via the cached currentUser — a serious auth bypass.
+      try {
+        localStorage.removeItem('wbs_token');
+        localStorage.removeItem('wbs_user');
+      } catch { /* ignore storage errors (private mode) */ }
+      set({ currentUser: null, authError: err instanceof Error ? err.message : 'Login failed.' });
+      // Re-throw so the LoginPage can branch on success/failure deterministically
+      // instead of inferring it from currentUser state (which is racy).
+      throw err;
     }
   },
 
-  logout: () => {
+  logout: async () => {
+    // Persist any unsaved local state before tearing down the session so the
+    // user doesn't lose work. The Definition page is the only surface that
+    // keeps a true client-side draft (all other mutations hit the API per
+    // change), so we flush it via saveProject if a project is active.
+    const { activeProjectId, currentUser } = get();
+    if (activeProjectId) {
+      try {
+        await get().saveProject(activeProjectId);
+      } catch {
+        // Swallow — a failed save must NOT block sign-out. The user may be
+        // signing out precisely because the network is broken.
+      }
+    }
+    // Stash a "where they were" hint so post-login they can resume the same
+    // project + route. Scoped per user so different accounts on the same
+    // browser don't collide.
+    try {
+      if (currentUser?.id) {
+        const hint = { projectId: activeProjectId, route: window.location.pathname + window.location.search };
+        localStorage.setItem(`wbs_last_state_${currentUser.id}`, JSON.stringify(hint));
+      }
+    } catch { /* ignore storage errors (private mode / quota) */ }
+
     localStorage.removeItem('wbs_token');
     localStorage.removeItem('wbs_user');
     set({ currentUser: null, authError: null, savedProjects: [], activeProjectId: null });

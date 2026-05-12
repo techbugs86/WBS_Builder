@@ -32,8 +32,17 @@ declare global {
   }
 }
 
-// Verifies the project exists, belongs to the caller's org, and attaches it to req.project.
-// Owners and admins can access any project in their org; PMs only see their own.
+// Verifies the project exists and belongs to the caller's org, then attaches
+// it to req.project. Org membership is the only authorization gate here —
+// any role (owner/admin/pm) can READ + EDIT any project in their org.
+//
+// Destructive operations (DELETE project, DELETE All epics/journeys/tasks,
+// per-item deletes, prompt edits, integrations) are guarded by per-route
+// `requireRole('admin')` checks, so PMs still can't wipe data they shouldn't.
+//
+// Earlier this middleware had a "PMs can only see projects they created"
+// rule. That broke the common agency workflow where an admin sets up a
+// project and PMs run the day-to-day pipeline on it.
 export async function requireOrgProject(req: Request, res: Response, next: NextFunction): Promise<void> {
   const projectId = req.params['id'];
   if (!projectId) { res.status(400).json({ error: 'Missing project id.' }); return; }
@@ -42,14 +51,7 @@ export async function requireOrgProject(req: Request, res: Response, next: NextF
   if (!project) { res.status(404).json({ error: 'Project not found.' }); return; }
 
   if (project.org_id !== req.user!.orgId) {
-    res.status(403).json({ error: 'Access denied.' });
-    return;
-  }
-
-  // PMs can only access projects they created; admins/owners see all in the org
-  const role = req.user!.role;
-  if (role === 'pm' && project.created_by !== req.user!.userId) {
-    res.status(403).json({ error: 'Access denied.' });
+    res.status(403).json({ error: 'Access denied — project belongs to a different organisation.' });
     return;
   }
 

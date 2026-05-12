@@ -19,6 +19,7 @@ import { useProjectStore } from '../store/useProjectStore';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { ChallengeBar } from '../components/ChallengeBar';
+import { CascadeRegenDialog } from '../components/CascadeRegenDialog';
 import { VersionDropdown } from '../components/VersionDropdown';
 import type { OpenQuestion } from '../data/mockData';
 
@@ -523,6 +524,7 @@ export function BriefPage() {
           <ChallengeBar stage="brief" />
         </div>
       )}
+      <CascadeRegenDialog />
     </motion.div>
   );
 }

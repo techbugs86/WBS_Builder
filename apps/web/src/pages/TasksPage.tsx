@@ -153,11 +153,15 @@ function TaskRow({
   index,
   isUpdated,
   onEdit,
+  onDelete,
+  canDelete,
 }: {
   taskWithHistory: TaskWithHistory;
   index: number;
   isUpdated: boolean;
   onEdit: () => void;
+  onDelete: () => void;
+  canDelete: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const setTaskStatus = useProjectStore((s) => s.setTaskStatus);
@@ -261,6 +265,16 @@ function TaskRow({
           <Button size="icon-sm" variant="ghost" onClick={onEdit} title="View & edit task">
             <Edit2 size={12} />
           </Button>
+          {canDelete && (
+            <Button
+              size="icon-sm"
+              variant="destructive"
+              onClick={onDelete}
+              title="Delete this task"
+            >
+              <Trash2 size={12} />
+            </Button>
+          )}
         </div>
       </div>
 
@@ -459,24 +473,48 @@ const STATUS_TABS: { label: string; value: StatusFilter }[] = [
   { label: 'Flagged', value: 'flagged' },
 ];
 
+// Average tasks-per-journey across past LawnLink / FreshFork / MediTrack runs
+// landed in the 4-6 range. Use 5 as the projected per-journey output to drive
+// the progress bar's expected-total denominator.
+const TASKS_PER_JOURNEY_ESTIMATE = 5;
+
 export function TasksPage() {
   const { id: projectId } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const tasksWithHistory = useProjectStore((s) => s.tasks);
+  const journeysWithHistory = useProjectStore((s) => s.journeys);
   const regenState = useProjectStore((s) => s.regenState);
   const generateTasks = useProjectStore((s) => s.generateTasks);
   const isGenerating = useProjectStore((s) => s.isGenerating);
   const approveAllTasks = useProjectStore((s) => s.approveAllTasks);
   const deleteAllTasks = useProjectStore((s) => s.deleteAllTasks);
+  const deleteTask = useProjectStore((s) => s.deleteTask);
   const setTaskStatus = useProjectStore((s) => s.setTaskStatus);
   const currentUser = useProjectStore((s) => s.currentUser);
-  const canDelete = currentUser?.role === 'admin' || currentUser?.role === 'owner';
+  // All authenticated org members can delete — see middleware/requireRole.ts
+  const canDelete = Boolean(currentUser);
   const [showDeleteAll, setShowDeleteAll] = useState(false);
+  const [pendingTaskDelete, setPendingTaskDelete] = useState<{ id: string; title: string; wbsId: string } | null>(null);
   // Project hydration handled by <ProjectWorkspace> — no loadProject here.
   // Task generation is triggered manually via the "Generate Tasks" button —
   // we deliberately do NOT auto-generate on mount.
 
   const tasks = tasksWithHistory.map((t) => t.current);
+
+  // Progress bar math during task generation. We don't know the exact final
+  // task count up front (LLM output varies 3-7 per journey), so we estimate:
+  //   expected = journeyCount * 5
+  //   percent  = min(currentTaskCount / expected * 100, 95)  while generating
+  //   percent  = 100                                         when generation completes
+  // Floor at 5% during the warm-up window so the bar isn't visually empty.
+  const isTaskGen = isGenerating === 'tasks';
+  const estimatedTotal = Math.max(
+    journeysWithHistory.length * TASKS_PER_JOURNEY_ESTIMATE,
+    1,
+  );
+  const rawPercent = isTaskGen
+    ? Math.min(95, Math.max(5, Math.round((tasksWithHistory.length / estimatedTotal) * 100)))
+    : 100;
 
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [assigneeFilter, setAssigneeFilter] = useState<string>('All');
@@ -660,32 +698,53 @@ export function TasksPage() {
 
             {/* Task list */}
             <div className="space-y-2 mb-8">
-              {/* While generating with no tasks yet → big visible loader.
-                  As tasks stream in (progressive backend save + polling), they
-                  fill in below the loader header without needing a refresh. */}
-              {isGenerating === 'tasks' && tasksWithHistory.length === 0 && (
+              {/* Generation progress bar. Stays visible the entire time
+                  isGenerating === 'tasks'. Combines:
+                    - phase label (warming up / streaming / finalising)
+                    - live task counter (current of estimated total)
+                    - animated progress fill with percentage
+                  Tasks stream into the list below in real time as each
+                  journey's batch finishes on the backend (3s polling). */}
+              {isTaskGen && (
                 <div
-                  className="flex flex-col items-center justify-center py-16 rounded-xl"
-                  style={{ background: 'rgba(124,58,237,0.06)', border: '1px solid rgba(124,58,237,0.2)' }}
+                  className="rounded-xl p-4 mb-4 space-y-3"
+                  style={{ background: 'rgba(124,58,237,0.07)', border: '1px solid rgba(124,58,237,0.25)' }}
                 >
-                  <Loader size={28} className="animate-spin mb-4" style={{ color: 'var(--accent-text)' }} />
-                  <p className="text-sm font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>
-                    Generating tasks…
-                  </p>
-                  <p className="text-xs text-center max-w-md" style={{ color: 'var(--text-muted)' }}>
-                    The AI is decomposing every approved journey into atomic tasks. This typically takes 30-60 seconds. Tasks will appear here as they're created.
-                  </p>
-                </div>
-              )}
-
-              {/* If generation is happening AND we already have some tasks streaming in */}
-              {isGenerating === 'tasks' && tasksWithHistory.length > 0 && (
-                <div
-                  className="flex items-center gap-2 py-2 px-3 mb-2 rounded-md text-xs"
-                  style={{ background: 'rgba(124,58,237,0.07)', border: '1px solid rgba(124,58,237,0.2)', color: 'var(--accent-text)' }}
-                >
-                  <Loader size={12} className="animate-spin" />
-                  <span>Generating more tasks ({tasksWithHistory.length} so far)…</span>
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Loader size={14} className="animate-spin shrink-0" style={{ color: 'var(--accent-text)' }} />
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+                          {tasksWithHistory.length === 0
+                            ? 'Generating tasks…'
+                            : rawPercent < 90
+                            ? `Generating tasks (${tasksWithHistory.length} of ~${estimatedTotal})…`
+                            : `Finalising tasks (${tasksWithHistory.length} so far)…`}
+                        </p>
+                        <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                          The AI is decomposing every approved journey into atomic tasks. Tasks appear here as they're created.
+                        </p>
+                      </div>
+                    </div>
+                    <span
+                      className="text-base font-mono font-bold shrink-0 tabular-nums"
+                      style={{ color: 'var(--accent-text)' }}
+                    >
+                      {rawPercent}%
+                    </span>
+                  </div>
+                  <div
+                    className="h-2 rounded-full overflow-hidden"
+                    style={{ background: 'rgba(124,58,237,0.15)' }}
+                  >
+                    <motion.div
+                      className="h-full"
+                      style={{ background: 'linear-gradient(90deg, #7c3aed, #a78bfa)' }}
+                      initial={false}
+                      animate={{ width: `${rawPercent}%` }}
+                      transition={{ duration: 0.6, ease: 'easeOut' }}
+                    />
+                  </div>
                 </div>
               )}
 
@@ -701,6 +760,12 @@ export function TasksPage() {
                     index={i}
                     isUpdated={regenState.affectedIds.includes(taskH.current.id)}
                     onEdit={() => setSelectedTaskId(taskH.current.id)}
+                    onDelete={() => setPendingTaskDelete({
+                      id: taskH.current.id,
+                      title: taskH.current.title,
+                      wbsId: taskH.current.wbsId,
+                    })}
+                    canDelete={canDelete}
                   />
                 ))
               )}
@@ -773,6 +838,22 @@ export function TasksPage() {
           setShowDeleteAll(false);
         }}
         onCancel={() => setShowDeleteAll(false)}
+      />
+
+      <ConfirmDialog
+        open={pendingTaskDelete !== null}
+        title="Delete this task?"
+        message={`${pendingTaskDelete?.wbsId ?? ''} — "${pendingTaskDelete?.title ?? ''}" will be permanently removed (including its ClickUp mapping if synced). Other tasks are unaffected. This cannot be undone.`}
+        detail={`1 task will be deleted`}
+        confirmLabel="Delete task"
+        variant="destructive"
+        onConfirm={async () => {
+          if (pendingTaskDelete) {
+            await deleteTask(pendingTaskDelete.id);
+            setPendingTaskDelete(null);
+          }
+        }}
+        onCancel={() => setPendingTaskDelete(null)}
       />
     </motion.div>
   );

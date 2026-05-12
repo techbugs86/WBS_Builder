@@ -289,15 +289,31 @@ export function SyncPage() {
       <div className="grid grid-cols-2 gap-4">
         {/* Task table */}
         <div>
-          <h2 className="text-[11px] font-semibold uppercase tracking-widest mb-3" style={{ color: 'var(--text-muted)' }}>Task Status</h2>
-          <div className="rounded-xl overflow-hidden" style={{ border: '1px solid var(--border)' }}>
+          <h2 className="text-[11px] font-semibold uppercase tracking-widest mb-3 flex items-center gap-2" style={{ color: 'var(--text-muted)' }}>
+            Task Status
+            {tasks.length > 20 && (
+              <span className="text-[10px] font-normal normal-case tracking-normal" style={{ color: 'var(--text-dim)' }}>
+                ({tasks.length} tasks · scroll for more)
+              </span>
+            )}
+          </h2>
+          {/* Cap the visible body at ~20 rows. Header is sticky so it stays
+              visible while the user scrolls through long task lists (LawnLink
+              has 100+). Scrollbar appears only when content overflows. */}
+          <div
+            className="rounded-xl overflow-y-auto overflow-x-hidden"
+            style={{
+              border: '1px solid var(--border)',
+              maxHeight: '720px',
+            }}
+          >
             <table className="w-full text-xs">
-              <thead>
+              <thead className="sticky top-0 z-10">
                 <tr style={{ borderBottom: '1px solid var(--border)', background: 'var(--bg-deep)' }}>
-                  <th className="text-left px-3 py-2.5 font-medium" style={{ color: 'var(--text-muted)' }}>WBS</th>
-                  <th className="text-left px-3 py-2.5 font-medium" style={{ color: 'var(--text-muted)' }}>Title</th>
-                  <th className="text-left px-3 py-2.5 font-medium" style={{ color: 'var(--text-muted)' }}>Domain</th>
-                  <th className="text-left px-3 py-2.5 font-medium" style={{ color: 'var(--text-muted)' }}>ClickUp</th>
+                  <th className="text-left px-3 py-2.5 font-medium" style={{ color: 'var(--text-muted)', background: 'var(--bg-deep)' }}>WBS</th>
+                  <th className="text-left px-3 py-2.5 font-medium" style={{ color: 'var(--text-muted)', background: 'var(--bg-deep)' }}>Title</th>
+                  <th className="text-left px-3 py-2.5 font-medium" style={{ color: 'var(--text-muted)', background: 'var(--bg-deep)' }}>Domain</th>
+                  <th className="text-left px-3 py-2.5 font-medium" style={{ color: 'var(--text-muted)', background: 'var(--bg-deep)' }}>ClickUp</th>
                 </tr>
               </thead>
               <tbody>
