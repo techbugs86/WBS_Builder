@@ -130,12 +130,13 @@ const EPICS_SCHEMA_DESC = `
 Return a JSON array (or an object with key "epics" containing the array).
 Each epic object MUST use exactly these field names:
 {
-  "title": "string",
+  "title": "string — max 60 characters",
   "domain": "auth" | "billing" | "search" | "messaging" | "profile" | "admin" | "notifications",
-  "description": "string — 2-3 sentences",
-  "storyPoints": "number — Fibonacci: 1, 2, 3, 5, 8, 13, 21, 34, 55, 89"
+  "description": "string — 1-2 sentences, max 200 characters total",
+  "storyPoints": "number — Fibonacci: 1, 2, 3, 5, 8, 13, 21"
 }
 "domain" MUST be one of the seven literal strings above. Do not invent new domain values.
+Keep descriptions tight — no marketing copy, no rationale, just what the epic covers.
 Do not include id, status — the system adds those.`;
 
 const JOURNEYS_SCHEMA_DESC = `
@@ -171,28 +172,52 @@ const TASKS_SCHEMA_DESC = `
 Return a JSON array (or an object with key "tasks" containing the array).
 Each task object MUST use exactly these field names:
 {
-  "title": "string — imperative",
+  "title": "string — imperative, max 80 characters",
   "estimateHours": "number — integer between 4 and 16",
   "acceptanceCriteria": [
     {
       "type": "functional" | "non-functional" | "technical",
-      "given": "string",
-      "when": "string",
-      "then": "string"
+      "given": "string — max 120 characters",
+      "when": "string — max 120 characters",
+      "then": "string — max 150 characters"
     }
   ]
 }
-acceptanceCriteria must contain 3 to 7 items. Each item must have all four fields (type, given, when, then) as non-empty strings.
+acceptanceCriteria must contain 3 to 5 items (NOT more — pick the most important AC, don't pad).
+Each item must have all four fields (type, given, when, then) as non-empty strings.
+Keep AC text concise — one sentence per field, no compound clauses.
 Do not include id, wbsId, domain, epicId, journeyId, status, assignee — the system adds those.`;
+
+// Stage → model mapping. The brief is the foundational artifact — every
+// downstream stage builds on it, so we keep gpt-4o (or claude-sonnet) for
+// quality. Epics/journeys/tasks are structured-JSON workloads where the cheap
+// models perform near-identically and save ~95% on credit.
+//
+// Override per-stage via env: AI_MODEL_BRIEF_OPENAI=gpt-4o-mini, etc.
+type Stage = 'brief' | 'epics' | 'journeys' | 'tasks' | 'rewrite';
+
+function modelFor(stage: Stage, provider: 'anthropic' | 'openai'): string {
+  const envKey = `AI_MODEL_${stage.toUpperCase()}_${provider.toUpperCase()}`;
+  const fromEnv = process.env[envKey];
+  if (fromEnv) return fromEnv;
+
+  if (provider === 'openai') {
+    return stage === 'brief' ? 'gpt-4o' : 'gpt-4o-mini';
+  }
+  // Anthropic: Sonnet for brief, Haiku for the high-volume stages.
+  return stage === 'brief' ? 'claude-sonnet-4-6' : 'claude-haiku-4-5-20251001';
+}
 
 async function callLLM(
   provider: 'anthropic' | 'openai',
   systemPrompt: string,
   userMessage: string,
+  stage: Stage = 'brief',
 ): Promise<string> {
   // Retry policy: rate-limit (429) and transient 5xx errors get exponential
   // backoff (1.5s → 4s → 9s). Other errors (auth, validation) bail immediately.
   const RETRY_DELAYS_MS = [1500, 4000, 9000];
+  const model = modelFor(stage, provider);
   let lastErr: unknown;
 
   for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
@@ -201,7 +226,7 @@ async function callLLM(
         const { default: Anthropic } = await import('@anthropic-ai/sdk');
         const client = new Anthropic({ apiKey: process.env['ANTHROPIC_API_KEY'] });
         const msg = await client.messages.create({
-          model: 'claude-sonnet-4-6',
+          model,
           max_tokens: 4096,
           system: systemPrompt + '\n\nRespond ONLY with valid JSON. No markdown, no explanation.',
           messages: [{ role: 'user', content: userMessage }],
@@ -213,7 +238,7 @@ async function callLLM(
         const { default: OpenAI } = await import('openai');
         const client = new OpenAI({ apiKey: process.env['OPENAI_API_KEY'] });
         const completion = await client.chat.completions.create({
-          model: 'gpt-4o',
+          model,
           response_format: { type: 'json_object' },
           messages: [
             { role: 'system', content: systemPrompt + '\n\nRespond ONLY with valid JSON.' },
@@ -430,7 +455,7 @@ export async function generateBrief(
     .replace('{{client_name}}', client)
     .replace('{{client}}', client);
 
-  const raw = await callLLM(provider, systemPrompt + BRIEF_SCHEMA_DESC, userMessage);
+  const raw = await callLLM(provider, systemPrompt + BRIEF_SCHEMA_DESC, userMessage, 'brief');
   const parsed = JSON.parse(raw);
 
   // Some LLMs nest the result under a key like "brief" — unwrap if needed.
@@ -466,7 +491,7 @@ export async function generateEpics(
 
   const userMessage = applyChallenge(userTemplate, challengeText)
     .replace('{{brief_json}}', JSON.stringify(brief, null, 2));
-  const raw = await callLLM(provider, systemPrompt + EPICS_SCHEMA_DESC, userMessage);
+  const raw = await callLLM(provider, systemPrompt + EPICS_SCHEMA_DESC, userMessage, 'epics');
   const parsed = JSON.parse(raw);
   const arr = Array.isArray(parsed) ? parsed : parsed.epics ?? parsed.items ?? [];
   return arr.map((e: Record<string, unknown>) => EpicSchema.parse({ id: uuid(), status: 'pending', ...e }));
@@ -528,7 +553,7 @@ async function generateJourneysForEpic(
     .replace('{{epics_json}}', JSON.stringify([epic], null, 2))
     .replace('{{brief_json}}', JSON.stringify(brief, null, 2)) + focusedDirective;
 
-  const raw = await callLLM(provider, systemPrompt + JOURNEYS_SCHEMA_DESC, userMessage);
+  const raw = await callLLM(provider, systemPrompt + JOURNEYS_SCHEMA_DESC, userMessage, 'journeys');
   const parsed = JSON.parse(raw);
   const arr = Array.isArray(parsed) ? parsed : parsed.journeys ?? parsed.items ?? [];
   return arr.map((j: Record<string, unknown>) =>
@@ -560,7 +585,7 @@ export async function generateTasks(
     .replace('{{journey_json}}', JSON.stringify(journey, null, 2))
     .replace('{{epic_json}}', JSON.stringify(epic, null, 2));
 
-  const raw = await callLLM(provider, systemPrompt + TASKS_SCHEMA_DESC, userMessage);
+  const raw = await callLLM(provider, systemPrompt + TASKS_SCHEMA_DESC, userMessage, 'tasks');
   const parsed = JSON.parse(raw);
   const arr = Array.isArray(parsed) ? parsed : parsed.tasks ?? parsed.items ?? [];
 
@@ -659,7 +684,7 @@ export async function rewriteItem(
     `Return ONLY the updated JSON object — no commentary, no markdown.`,
   ].join('\n');
 
-  const raw = await callLLM(provider, systemPrompt + schemaDesc, userMessage);
+  const raw = await callLLM(provider, systemPrompt + schemaDesc, userMessage, 'rewrite');
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(raw);

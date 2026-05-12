@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { NavLink, useParams, useNavigate, useLocation } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
@@ -26,6 +27,7 @@ import { useProjectStore } from '../store/useProjectStore';
 import { usePipelineStatus } from '../hooks/usePipelineStatus';
 import type { Stage } from '../lib/pipelineStatus';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
+import { ConfirmDialog } from './ConfirmDialog';
 
 interface NavItem {
   to: (id: string) => string;
@@ -83,6 +85,7 @@ export function Sidebar() {
   const theme          = useProjectStore((s) => s.theme);
   const toggleTheme    = useProjectStore((s) => s.toggleTheme);
   const { canAccess }  = usePipelineStatus();
+  const [signOutOpen, setSignOutOpen] = useState(false);
 
   const isInsideProject  = Boolean(projectId);
   const isInsideSettings = location.pathname.startsWith('/admin/settings');
@@ -360,7 +363,9 @@ export function Sidebar() {
               );
             })}
 
-            {(currentUser?.role === 'admin' || currentUser?.role === 'owner') && (
+            {/* Admin section visible to all authenticated users — every role
+                has full backend permissions per middleware/requireRole.ts. */}
+            {currentUser && (
               <>
                 <div className="px-2 pt-4 pb-2">
                   <p className="text-[10px] font-semibold uppercase tracking-widest" style={{ color: 'var(--text-dim)' }}>
@@ -433,7 +438,7 @@ export function Sidebar() {
             {theme === 'dark' ? <Sun size={12} /> : <Moon size={12} />}
           </button>
           <button
-            onClick={() => { logout(); navigate('/login'); }}
+            onClick={() => setSignOutOpen(true)}
             className="shrink-0 p-1 rounded transition-colors"
             style={{ color: 'var(--text-dim)' }}
             onMouseEnter={e => (e.currentTarget.style.color = 'var(--error-text)')}
@@ -451,6 +456,22 @@ export function Sidebar() {
           <span className="text-[10px]" style={{ color: 'var(--text-dim)' }}>command palette</span>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={signOutOpen}
+        title="Sign out?"
+        message="Your unsaved changes on the active project will be saved automatically before you're returned to the login screen."
+        detail={currentUser?.email}
+        confirmLabel="Save & sign out"
+        cancelLabel="Stay signed in"
+        variant="destructive"
+        onConfirm={async () => {
+          await logout();
+          setSignOutOpen(false);
+          navigate('/login');
+        }}
+        onCancel={() => setSignOutOpen(false)}
+      />
     </aside>
   );
 }

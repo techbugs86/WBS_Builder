@@ -189,13 +189,27 @@ projectsRouter.get('/', async (req, res) => {
   const projects = await Promise.all(
     rows.map(async (p) => {
       const counts = await getProjectCounts(p.id);
+      // Reconcile the stored `status` column against actual sync coverage.
+      // The column gets set to 'synced' on first successful sync but never
+      // unsets — so after the user regenerates tasks (creating new IDs without
+      // ClickUp mappings) the badge keeps lying. Truth is in clickup_mappings:
+      //   - 0 synced tasks → can't be 'synced'; fall back to 'draft'
+      //   - syncedCount < taskCount → only 'synced' if the unsynced ones are
+      //     pending/flagged (which the count check already filters at sync time);
+      //     to keep this simple we treat any unsynced as "drift" and mark draft.
+      // Also lazily heal the DB so the next read is correct without a write.
+      let status = p.status;
+      if (status === 'synced' && counts.syncedCount < counts.taskCount) {
+        status = 'draft';
+        await execute("UPDATE projects SET status = 'draft' WHERE id = ?", [p.id]);
+      }
       return {
         id: p.id,
         name: p.name,
         client: p.client,
         createdAt: p.created_at,
         updatedAt: p.updated_at,
-        status: p.status,
+        status,
         provider: p.provider,
         ...counts,
       };
@@ -259,7 +273,14 @@ projectsRouter.use('/:id', requireOrgProject);
 projectsRouter.get('/:id', async (req, res) => {
   const project = req.project as unknown as ProjectRow;
   const counts = await getProjectCounts(project.id);
-  res.json({ ...project, ...counts });
+  // Same reconciliation as the list endpoint — keep the single-project badge
+  // honest when the user re-syncs after regenerating tasks.
+  let status = project.status;
+  if (status === 'synced' && counts.syncedCount < counts.taskCount) {
+    status = 'draft';
+    await execute("UPDATE projects SET status = 'draft' WHERE id = ?", [project.id]);
+  }
+  res.json({ ...project, status, ...counts });
 });
 
 // PATCH /projects/:id
@@ -493,6 +514,145 @@ projectsRouter.delete('/:id/tasks', requireRole('admin'), asyncHandler(async (re
   const result = await execute('DELETE FROM tasks WHERE project_id = ?', [projectId]);
   await execute("UPDATE projects SET status = 'draft', updated_at = NOW() WHERE id = ?", [projectId]);
   res.json({ deleted: true, type: 'tasks', affectedRows: result.affectedRows });
+}));
+
+// ─── Singular delete endpoints ────────────────────────────────────────────────
+// Delete one epic / journey / task by its key. Cascades downstream:
+//   - Epic delete → journeys with that epicId → tasks under those journeys
+//   - Journey delete → tasks with that journeyId
+//   - Task delete → just the task row
+// Each also wipes any matching clickup_mappings so future syncs don't try to
+// update ghost ClickUp items.
+
+// DELETE /projects/:id/epics/:epicKey
+projectsRouter.delete('/:id/epics/:epicKey', requireRole('admin'), asyncHandler(async (req, res) => {
+  const projectId = req.params['id']!;
+  const epicKey   = req.params['epicKey']!;
+
+  // Look up the epic.id (UUID inside JSON data) so we can find its children.
+  const epicRow = await queryOne<{ data: string }>(
+    'SELECT data FROM epics WHERE project_id = ? AND epic_key = ? AND is_current = 1',
+    [projectId, epicKey],
+  );
+  if (!epicRow) { res.status(404).json({ error: 'Epic not found.' }); return; }
+  const epicData = safeJsonParse<{ id?: string }>(epicRow.data, {});
+  const epicId = epicData.id;
+
+  if (epicId) {
+    // Find all journey_keys whose data.epicId === this epic
+    const journeyRows = await query<{ journey_key: string; data: string }>(
+      'SELECT journey_key, data FROM journeys WHERE project_id = ? AND is_current = 1',
+      [projectId],
+    );
+    const journeyKeys: string[] = [];
+    const journeyIds: string[] = [];
+    for (const r of journeyRows) {
+      const d = safeJsonParse<{ id?: string; epicId?: string }>(r.data, {});
+      if (d.epicId === epicId) {
+        journeyKeys.push(r.journey_key);
+        if (d.id) journeyIds.push(d.id);
+      }
+    }
+
+    // Find all task_keys whose data.epicId === this epic OR data.journeyId is in journeyIds
+    const taskRows = await query<{ task_key: string; data: string }>(
+      'SELECT task_key, data FROM tasks WHERE project_id = ? AND is_current = 1',
+      [projectId],
+    );
+    const taskKeys: string[] = [];
+    for (const r of taskRows) {
+      const d = safeJsonParse<{ epicId?: string; journeyId?: string }>(r.data, {});
+      if (d.epicId === epicId || (d.journeyId && journeyIds.includes(d.journeyId))) {
+        taskKeys.push(r.task_key);
+      }
+    }
+
+    if (taskKeys.length > 0) {
+      const placeholders = taskKeys.map(() => '?').join(',');
+      await execute(
+        `DELETE FROM clickup_mappings WHERE project_id = ? AND entity_type = 'task' AND entity_key IN (${placeholders})`,
+        [projectId, ...taskKeys],
+      );
+      await execute(
+        `DELETE FROM tasks WHERE project_id = ? AND task_key IN (${placeholders})`,
+        [projectId, ...taskKeys],
+      );
+    }
+    if (journeyKeys.length > 0) {
+      const placeholders = journeyKeys.map(() => '?').join(',');
+      await execute(
+        `DELETE FROM journeys WHERE project_id = ? AND journey_key IN (${placeholders})`,
+        [projectId, ...journeyKeys],
+      );
+    }
+  }
+
+  // Delete the epic itself + its list mapping
+  await execute(
+    'DELETE FROM clickup_mappings WHERE project_id = ? AND entity_type = \'list\' AND entity_key = ?',
+    [projectId, epicKey],
+  );
+  const result = await execute('DELETE FROM epics WHERE project_id = ? AND epic_key = ?', [projectId, epicKey]);
+  await execute("UPDATE projects SET updated_at = NOW() WHERE id = ?", [projectId]);
+  res.json({ deleted: true, type: 'epic', epicKey, affectedRows: result.affectedRows });
+}));
+
+// DELETE /projects/:id/journeys/:journeyKey
+projectsRouter.delete('/:id/journeys/:journeyKey', requireRole('admin'), asyncHandler(async (req, res) => {
+  const projectId   = req.params['id']!;
+  const journeyKey  = req.params['journeyKey']!;
+
+  // Find the journey.id so we can locate its tasks
+  const journeyRow = await queryOne<{ data: string }>(
+    'SELECT data FROM journeys WHERE project_id = ? AND journey_key = ? AND is_current = 1',
+    [projectId, journeyKey],
+  );
+  if (!journeyRow) { res.status(404).json({ error: 'Journey not found.' }); return; }
+  const journeyData = safeJsonParse<{ id?: string }>(journeyRow.data, {});
+  const journeyId = journeyData.id;
+
+  if (journeyId) {
+    // Tasks under this journey
+    const taskRows = await query<{ task_key: string; data: string }>(
+      'SELECT task_key, data FROM tasks WHERE project_id = ? AND is_current = 1',
+      [projectId],
+    );
+    const taskKeys: string[] = [];
+    for (const r of taskRows) {
+      const d = safeJsonParse<{ journeyId?: string }>(r.data, {});
+      if (d.journeyId === journeyId) taskKeys.push(r.task_key);
+    }
+    if (taskKeys.length > 0) {
+      const placeholders = taskKeys.map(() => '?').join(',');
+      await execute(
+        `DELETE FROM clickup_mappings WHERE project_id = ? AND entity_type = 'task' AND entity_key IN (${placeholders})`,
+        [projectId, ...taskKeys],
+      );
+      await execute(
+        `DELETE FROM tasks WHERE project_id = ? AND task_key IN (${placeholders})`,
+        [projectId, ...taskKeys],
+      );
+    }
+  }
+
+  const result = await execute('DELETE FROM journeys WHERE project_id = ? AND journey_key = ?', [projectId, journeyKey]);
+  await execute("UPDATE projects SET updated_at = NOW() WHERE id = ?", [projectId]);
+  res.json({ deleted: true, type: 'journey', journeyKey, affectedRows: result.affectedRows });
+}));
+
+// DELETE /projects/:id/tasks/:taskKey
+projectsRouter.delete('/:id/tasks/:taskKey', requireRole('admin'), asyncHandler(async (req, res) => {
+  const projectId = req.params['id']!;
+  const taskKey   = req.params['taskKey']!;
+
+  await execute(
+    'DELETE FROM clickup_mappings WHERE project_id = ? AND entity_type = \'task\' AND entity_key = ?',
+    [projectId, taskKey],
+  );
+  const result = await execute('DELETE FROM tasks WHERE project_id = ? AND task_key = ?', [projectId, taskKey]);
+  if (result.affectedRows === 0) { res.status(404).json({ error: 'Task not found.' }); return; }
+  await execute("UPDATE projects SET updated_at = NOW() WHERE id = ?", [projectId]);
+  res.json({ deleted: true, type: 'task', taskKey, affectedRows: result.affectedRows });
 }));
 
 // ─── Epics ────────────────────────────────────────────────────────────────────

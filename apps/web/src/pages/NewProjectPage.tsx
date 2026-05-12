@@ -59,6 +59,20 @@ function FileIcon({ type }: { type: string }) {
   return <File size={14} style={{ color: 'var(--text-dim)' }} />;
 }
 
+/**
+ * Inline error message rendered below an input. Reserves no space when null,
+ * so layouts don't shift as errors appear/disappear.
+ */
+function FieldError({ message }: { message: string | null | undefined }) {
+  if (!message) return null;
+  return (
+    <p className="text-[11px] mt-1.5 text-red-400 flex items-center gap-1">
+      <span aria-hidden>•</span>
+      {message}
+    </p>
+  );
+}
+
 const STEP_LABELS = ['Project Info', 'Communication', 'Raw Input'];
 
 interface LocalAttachedFile extends AttachedFile {}
@@ -81,6 +95,10 @@ export function NewProjectPage() {
   const [rawInput, setRawInput] = useState('');
   const [attachedFiles, setAttachedFiles] = useState<LocalAttachedFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  // Track which fields the user has interacted with so validation messages
+  // appear on blur (or after a failed Continue click), not while they type.
+  const [touched, setTouched] = useState<Record<string, boolean>>({});
+  const markTouched = (field: string) => setTouched((t) => ({ ...t, [field]: true }));
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -106,7 +124,18 @@ export function NewProjectPage() {
     });
   }
 
+  // Submit lifecycle:
+  //   isCreating  — guards against double-submits, drives the button spinner
+  //   submitError — shown in the banner above the Nav row when create fails
+  // Without these, the previous handler swallowed errors silently into
+  // console.error, leaving the user staring at a button that "did nothing".
+  const [isCreating, setIsCreating] = useState(false);
+
   async function handleCreate() {
+    if (isCreating) return;
+    setIsCreating(true);
+    setSubmitError(null);
+
     // Update the store's active definition fields for display purposes
     setDefinitionField('name', name || 'Untitled Project');
     setDefinitionField('client', client);
@@ -130,8 +159,12 @@ export function NewProjectPage() {
       });
       navigate(`/projects/${id}/brief`);
     } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to create project.';
       console.error('Failed to create project:', err);
+      setSubmitError(`Could not create project: ${msg}. Check that the API is running and that you're logged in.`);
+      setIsCreating(false);
     }
+    // Note: on success we navigate away, so we don't need to reset isCreating.
   }
 
   function toggleChannel(ch: CommunicationChannel) {
@@ -142,8 +175,83 @@ export function NewProjectPage() {
     );
   }
 
-  const canStep1 = name.trim().length > 0 && client.trim().length > 0;
-  const canStep2 = contactPerson.trim().length > 0;
+  // Field-level validators. Each returns null when valid, or a user-facing
+  // error string. Run on change; messages render only when `touched[field]`.
+  //
+  // Note: channel reference fields are deliberately NOT validated as URLs.
+  // Per CHANNEL_PLACEHOLDERS, each channel takes freeform text (Upwork
+  // contract ID, email address/subject, Slack channel name, meeting notes,
+  // etc.) — not just URLs.
+
+  const errors = {
+    name:
+      name.trim().length === 0
+        ? 'Project name is required.'
+        : name.trim().length < 3
+        ? 'Use at least 3 characters.'
+        : name.trim().length > 80
+        ? 'Keep it under 80 characters.'
+        : null,
+    client:
+      client.trim().length === 0
+        ? 'Client name is required.'
+        : client.trim().length < 2
+        ? 'Use at least 2 characters.'
+        : client.trim().length > 80
+        ? 'Keep it under 80 characters.'
+        : null,
+    estimatedBudget:
+      estimatedBudget.trim().length > 0 && !/\d/.test(estimatedBudget)
+        ? 'Budget should include a number (e.g. "$50,000").'
+        : null,
+    startDate: (() => {
+      if (!startDate) return null;
+      const picked = new Date(startDate);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      return picked < today ? 'Start date cannot be in the past.' : null;
+    })(),
+    contactPerson:
+      contactPerson.trim().length === 0
+        ? 'Contact person is required.'
+        : contactPerson.trim().length < 2
+        ? 'Use at least 2 characters.'
+        : null,
+    rawInput:
+      rawInput.trim().length === 0
+        ? 'Raw client input is required so we can extract a brief.'
+        : rawInput.trim().length < 30
+        ? 'Add more detail (at least 30 characters) so the AI has enough to work with.'
+        : null,
+  } as const;
+
+  // No per-channel validation — references are freeform (URL, ID, email,
+  // channel name, free text). Empty object kept so existing read sites still type-check.
+  const channelLinkErrors: Partial<Record<CommunicationChannel, string>> = {};
+
+  const canStep1 = !errors.name && !errors.client && !errors.estimatedBudget && !errors.startDate;
+  const canStep2 = !errors.contactPerson && Object.keys(channelLinkErrors).length === 0;
+  const canCreate = canStep1 && canStep2 && !errors.rawInput;
+
+  // When Create Project is clicked but validation fails, we need to TELL the
+  // user what's wrong (silent no-op is the worst UX) and JUMP them back to
+  // the step that has the error so they can fix it. submitError is rendered
+  // as a banner above the action buttons.
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
+  // When the user clicks Continue but a field is invalid, surface ALL errors
+  // on the current step at once instead of waiting for individual blurs.
+  function tryAdvance() {
+    if (step === 0) {
+      markTouched('name'); markTouched('client'); markTouched('estimatedBudget'); markTouched('startDate');
+      if (!canStep1) return;
+    } else if (step === 1) {
+      markTouched('contactPerson');
+      for (const ch of communicationChannels) markTouched(`channelLink:${ch}`);
+      if (!canStep2) return;
+    }
+    setStep((s) => s + 1);
+  }
 
   return (
     <motion.div
@@ -210,10 +318,12 @@ export function NewProjectPage() {
                   type="text"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
+                  onBlur={() => markTouched('name')}
                   placeholder="e.g. Freelancer Marketplace Platform"
                   className="w-full px-4 py-3 rounded-xl text-sm placeholder-[var(--text-dim)] focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition-colors"
-                  style={{ background: 'var(--bg-input)', border: '1px solid var(--border)' }}
+                  style={{ background: 'var(--bg-input)', border: `1px solid ${touched['name'] && errors.name ? 'rgb(248,113,113)' : 'var(--border)'}` }}
                 />
+                {touched['name'] && <FieldError message={errors.name} />}
               </div>
               <div>
                 <label className="block text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: 'var(--text-secondary)' }}>
@@ -223,10 +333,12 @@ export function NewProjectPage() {
                   type="text"
                   value={client}
                   onChange={(e) => setClient(e.target.value)}
+                  onBlur={() => markTouched('client')}
                   placeholder="e.g. TalentConnect Inc."
                   className="w-full px-4 py-3 rounded-xl text-sm placeholder-[var(--text-dim)] focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition-colors"
-                  style={{ background: 'var(--bg-input)', border: '1px solid var(--border)' }}
+                  style={{ background: 'var(--bg-input)', border: `1px solid ${touched['client'] && errors.client ? 'rgb(248,113,113)' : 'var(--border)'}` }}
                 />
+                {touched['client'] && <FieldError message={errors.client} />}
               </div>
               <div>
                 <label className="block text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: 'var(--text-secondary)' }}>
@@ -258,10 +370,12 @@ export function NewProjectPage() {
                     type="text"
                     value={estimatedBudget}
                     onChange={(e) => setEstimatedBudget(e.target.value)}
+                    onBlur={() => markTouched('estimatedBudget')}
                     placeholder="e.g. $50,000"
                     className="w-full px-4 py-3 rounded-xl text-sm placeholder-[var(--text-dim)] focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition-colors"
-                  style={{ background: 'var(--bg-input)', border: '1px solid var(--border)' }}
+                    style={{ background: 'var(--bg-input)', border: `1px solid ${touched['estimatedBudget'] && errors.estimatedBudget ? 'rgb(248,113,113)' : 'var(--border)'}` }}
                   />
+                  {touched['estimatedBudget'] && <FieldError message={errors.estimatedBudget} />}
                 </div>
                 <div>
                   <label className="block text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: 'var(--text-secondary)' }}>
@@ -271,9 +385,11 @@ export function NewProjectPage() {
                     type="date"
                     value={startDate}
                     onChange={(e) => setStartDate(e.target.value)}
+                    onBlur={() => markTouched('startDate')}
                     className="w-full px-4 py-3 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition-colors"
-                  style={{ background: 'var(--bg-input)', border: '1px solid var(--border)' }}
+                    style={{ background: 'var(--bg-input)', border: `1px solid ${touched['startDate'] && errors.startDate ? 'rgb(248,113,113)' : 'var(--border)'}` }}
                   />
+                  {touched['startDate'] && <FieldError message={errors.startDate} />}
                 </div>
               </div>
             </motion.div>
@@ -322,10 +438,12 @@ export function NewProjectPage() {
                     type="text"
                     value={channelLinks[ch] ?? ''}
                     onChange={(e) => setChannelLinks((prev) => ({ ...prev, [ch]: e.target.value }))}
+                    onBlur={() => markTouched(`channelLink:${ch}`)}
                     placeholder={CHANNEL_PLACEHOLDERS[ch]}
                     className="w-full px-4 py-3 rounded-xl text-sm placeholder-[var(--text-dim)] focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition-colors"
-                    style={{ background: 'var(--bg-input)', border: '1px solid var(--border)' }}
+                    style={{ background: 'var(--bg-input)', border: `1px solid ${touched[`channelLink:${ch}`] && channelLinkErrors[ch] ? 'rgb(248,113,113)' : 'var(--border)'}` }}
                   />
+                  {touched[`channelLink:${ch}`] && <FieldError message={channelLinkErrors[ch]} />}
                 </div>
               ))}
               <div>
@@ -336,10 +454,12 @@ export function NewProjectPage() {
                   type="text"
                   value={contactPerson}
                   onChange={(e) => setContactPerson(e.target.value)}
+                  onBlur={() => markTouched('contactPerson')}
                   placeholder="e.g. Sarah Johnson"
                   className="w-full px-4 py-3 rounded-xl text-sm placeholder-[var(--text-dim)] focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent transition-colors"
-                  style={{ background: 'var(--bg-input)', border: '1px solid var(--border)' }}
+                  style={{ background: 'var(--bg-input)', border: `1px solid ${touched['contactPerson'] && errors.contactPerson ? 'rgb(248,113,113)' : 'var(--border)'}` }}
                 />
+                {touched['contactPerson'] && <FieldError message={errors.contactPerson} />}
               </div>
               <div>
                 <label className="block text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: 'var(--text-secondary)' }}>
@@ -374,15 +494,17 @@ export function NewProjectPage() {
             >
               <div>
                 <label className="block text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: 'var(--text-secondary)' }}>
-                  Raw Client Input
+                  Raw Client Input <span className="text-red-400">*</span>
                 </label>
                 <textarea
                   className="w-full min-h-[200px] px-4 py-3 rounded-xl text-sm placeholder-[var(--text-dim)] resize-none focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent font-mono leading-relaxed transition-colors"
-                  style={{ background: 'var(--bg-input)', border: '1px solid var(--border)' }}
+                  style={{ background: 'var(--bg-input)', border: `1px solid ${touched['rawInput'] && errors.rawInput ? 'rgb(248,113,113)' : 'var(--border)'}` }}
                   placeholder="Paste Upwork chat, transcript, or BD notes here…"
                   value={rawInput}
                   onChange={(e) => setRawInput(e.target.value)}
+                  onBlur={() => markTouched('rawInput')}
                 />
+                {touched['rawInput'] && <FieldError message={errors.rawInput} />}
                 <p className="text-[11px] mt-1.5" style={{ color: 'var(--text-dim)' }}>
                   PII is stripped before extraction. Raw input never reaches the LLM directly.
                 </p>
@@ -494,6 +616,31 @@ export function NewProjectPage() {
           )}
         </AnimatePresence>
 
+        {/* Submit error banner — appears when Create Project is clicked but
+            validation fails. Tells the user WHICH step is invalid so they
+            don't sit on the last step wondering why nothing happens. */}
+        {submitError && (
+          <div
+            className="mt-6 px-4 py-3 rounded-lg text-xs flex items-start gap-2"
+            style={{
+              background: 'rgba(239,68,68,0.08)',
+              border: '1px solid rgba(239,68,68,0.25)',
+              color: '#f87171',
+            }}
+            role="alert"
+          >
+            <span aria-hidden className="mt-0.5">⚠</span>
+            <span className="flex-1 leading-relaxed">{submitError}</span>
+            <button
+              onClick={() => setSubmitError(null)}
+              className="text-[10px] underline opacity-80 hover:opacity-100 shrink-0"
+              aria-label="Dismiss error"
+            >
+              dismiss
+            </button>
+          </div>
+        )}
+
         {/* Navigation */}
         <div className="flex items-center gap-3 mt-8 pt-6" style={{ borderTop: '1px solid var(--border-subtle)' }}>
           {step > 0 ? (
@@ -509,17 +656,43 @@ export function NewProjectPage() {
           )}
           <div className="flex-1" />
           {step < 2 ? (
-            <Button
-              onClick={() => setStep((s) => s + 1)}
-              disabled={step === 0 ? !canStep1 : step === 1 ? !canStep2 : false}
-              className="gap-1.5"
-            >
+            <Button onClick={tryAdvance} className="gap-1.5">
               Continue
               <ArrowRight size={14} />
             </Button>
           ) : (
-            <Button onClick={handleCreate} className="gap-1.5">
-              Create Project
+            <Button
+              disabled={isCreating}
+              onClick={() => {
+                // Surface every error at once so the user can fix all of them.
+                markTouched('name'); markTouched('client'); markTouched('estimatedBudget'); markTouched('startDate');
+                markTouched('contactPerson'); markTouched('rawInput');
+                for (const ch of communicationChannels) markTouched(`channelLink:${ch}`);
+
+                if (canCreate) {
+                  setSubmitError(null);
+                  void handleCreate();
+                  return;
+                }
+
+                // Build a specific, clickable banner explaining what's wrong
+                // AND jump back to the step containing the first invalid field.
+                if (!canStep1) {
+                  const firstStep1Error = errors.name ?? errors.client ?? errors.estimatedBudget ?? errors.startDate;
+                  setSubmitError(`Step 1 (Project Info) needs fixing: ${firstStep1Error}`);
+                  setStep(0);
+                } else if (!canStep2) {
+                  const firstChannelErr = Object.values(channelLinkErrors)[0];
+                  const firstStep2Error = errors.contactPerson ?? firstChannelErr;
+                  setSubmitError(`Step 2 (Communication) needs fixing: ${firstStep2Error}`);
+                  setStep(1);
+                } else if (errors.rawInput) {
+                  setSubmitError(errors.rawInput);
+                }
+              }}
+              className="gap-1.5"
+            >
+              {isCreating ? 'Creating…' : 'Create Project'}
               <ArrowRight size={14} />
             </Button>
           )}

@@ -27,11 +27,15 @@ function JourneyCard({
   isSelected,
   isUpdated,
   onClick,
+  onDelete,
+  canDelete,
 }: {
   journeyWithHistory: JourneyWithHistory;
   isSelected: boolean;
   isUpdated: boolean;
   onClick: () => void;
+  onDelete: () => void;
+  canDelete: boolean;
 }) {
   const journey = journeyWithHistory.current;
   const versions = journeyWithHistory.versions;
@@ -60,6 +64,17 @@ function JourneyCard({
             onRestore={(v) => restoreJourneyVersion(journey.id, v)}
             isUpdated={isUpdated}
           />
+          {canDelete && (
+            <button
+              onClick={(e) => { e.stopPropagation(); onDelete(); }}
+              className="p-1 rounded transition-colors hover:bg-red-900/30"
+              style={{ color: 'var(--error-text)' }}
+              title="Delete this journey (also removes its tasks)"
+              aria-label="Delete journey"
+            >
+              <Trash2 size={11} />
+            </button>
+          )}
         </div>
       </div>
       <button onClick={onClick} className="w-full text-left">
@@ -242,6 +257,11 @@ function JourneyDetail({
   );
 }
 
+// Average journeys-per-epic across past LawnLink / FreshFork / MediTrack runs
+// landed in the 1.6-2.5 range. Use 2.5 as the projected per-epic output to
+// drive the progress bar's expected-total denominator.
+const JOURNEYS_PER_EPIC_ESTIMATE = 2.5;
+
 export function JourneysPage() {
   const { id: projectId } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -251,6 +271,19 @@ export function JourneysPage() {
   const generateJourneys = useProjectStore((s) => s.generateJourneys);
   const isGenerating = useProjectStore((s) => s.isGenerating);
   // Project hydration handled by <ProjectWorkspace> — no loadProject here.
+
+  // Progress bar math during journey generation. Mirror the TasksPage approach:
+  //   expected = epicCount * 2.5 (rounded up)
+  //   percent  = clamp(currentJourneyCount / expected * 100, 5, 95) while running
+  //   percent  = 100                                                when done
+  const isJourneyGen = isGenerating === 'journeys';
+  const journeyEstimatedTotal = Math.max(
+    Math.ceil(epicsWithHistory.length * JOURNEYS_PER_EPIC_ESTIMATE),
+    1,
+  );
+  const journeyRawPercent = isJourneyGen
+    ? Math.min(95, Math.max(5, Math.round((journeysWithHistory.length / journeyEstimatedTotal) * 100)))
+    : 100;
 
   const allEpics = epicsWithHistory.map((e) => e.current);
   // Only show epics that have at least one journey — keeps the left panel
@@ -272,9 +305,12 @@ export function JourneysPage() {
 
   const approveAllJourneys = useProjectStore((s) => s.approveAllJourneys);
   const deleteAllJourneys = useProjectStore((s) => s.deleteAllJourneys);
+  const deleteJourney = useProjectStore((s) => s.deleteJourney);
   const currentUser = useProjectStore((s) => s.currentUser);
-  const canDelete = currentUser?.role === 'admin' || currentUser?.role === 'owner';
+  // All authenticated org members can delete — see middleware/requireRole.ts
+  const canDelete = Boolean(currentUser);
   const [showDeleteAll, setShowDeleteAll] = useState(false);
+  const [pendingJourneyDelete, setPendingJourneyDelete] = useState<{ id: string; title: string } | null>(null);
   const pendingJourneysCount = journeysWithHistory.filter((j) => j.current.status !== 'approved').length;
 
   const selectedEpic = allEpics.find((e) => e.id === selectedEpicId);
@@ -435,30 +471,53 @@ export function JourneysPage() {
           )}
 
           <div className="flex-1 p-6">
-            {/* Streaming progress banner — visible while regen is in flight, even after first journeys appear */}
-            {isGenerating === 'journeys' && journeysWithHistory.length > 0 && (
+            {/* Generation progress card — same UX as TasksPage. Shows the live
+                count vs estimated total + animated bar + percentage. Stays
+                visible the entire time isGenerating === 'journeys'. */}
+            {isJourneyGen && (
               <div
-                className="flex items-center gap-2 py-2 px-3 mb-3 rounded-md text-xs"
-                style={{ background: 'rgba(124,58,237,0.07)', border: '1px solid rgba(124,58,237,0.2)', color: 'var(--accent-text)' }}
+                className="rounded-xl p-4 mb-4 space-y-3"
+                style={{ background: 'rgba(124,58,237,0.07)', border: '1px solid rgba(124,58,237,0.25)' }}
               >
-                <Loader size={12} className="animate-spin" />
-                <span>Generating more journeys ({journeysWithHistory.length} so far)…</span>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <Loader size={14} className="animate-spin shrink-0" style={{ color: 'var(--accent-text)' }} />
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+                        {journeysWithHistory.length === 0
+                          ? 'Generating journeys…'
+                          : journeyRawPercent < 90
+                          ? `Generating journeys (${journeysWithHistory.length} of ~${journeyEstimatedTotal})…`
+                          : `Finalising journeys (${journeysWithHistory.length} so far)…`}
+                      </p>
+                      <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                        The AI is crafting user journeys for every approved epic. Journeys appear here as each epic completes.
+                      </p>
+                    </div>
+                  </div>
+                  <span
+                    className="text-base font-mono font-bold shrink-0 tabular-nums"
+                    style={{ color: 'var(--accent-text)' }}
+                  >
+                    {journeyRawPercent}%
+                  </span>
+                </div>
+                <div
+                  className="h-2 rounded-full overflow-hidden"
+                  style={{ background: 'rgba(124,58,237,0.15)' }}
+                >
+                  <motion.div
+                    className="h-full"
+                    style={{ background: 'linear-gradient(90deg, #7c3aed, #a78bfa)' }}
+                    initial={false}
+                    animate={{ width: `${journeyRawPercent}%` }}
+                    transition={{ duration: 0.6, ease: 'easeOut' }}
+                  />
+                </div>
               </div>
             )}
 
-            {journeysWithHistory.length === 0 && isGenerating === 'journeys' ? (
-              // Active full-page loader during the very first stretch of generation
-              <div
-                className="flex flex-col items-center justify-center py-20 rounded-xl"
-                style={{ background: 'rgba(124,58,237,0.06)', border: '1px solid rgba(124,58,237,0.2)' }}
-              >
-                <Loader size={28} className="animate-spin mb-4" style={{ color: 'var(--accent-text)' }} />
-                <p className="text-sm font-semibold mb-1" style={{ color: 'var(--text-primary)' }}>Generating journeys…</p>
-                <p className="text-xs text-center max-w-md" style={{ color: 'var(--text-muted)' }}>
-                  The AI is crafting user journeys for every approved epic. This typically takes 60-90 seconds for larger projects. Journeys will appear here as each epic completes.
-                </p>
-              </div>
-            ) : journeysWithHistory.length === 0 ? (
+            {journeysWithHistory.length === 0 && isGenerating === 'journeys' ? null : journeysWithHistory.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-20 text-center">
                 <div
                   className="w-14 h-14 rounded-full flex items-center justify-center mb-4"
@@ -495,6 +554,8 @@ export function JourneysPage() {
                       isSelected={selectedJourneyId === jH.current.id}
                       isUpdated={regenState.affectedIds.includes(jH.current.id)}
                       onClick={() => setSelectedJourneyId(selectedJourneyId === jH.current.id ? null : jH.current.id)}
+                      onDelete={() => setPendingJourneyDelete({ id: jH.current.id, title: jH.current.title })}
+                      canDelete={canDelete}
                     />
                   </motion.div>
                 ))}
@@ -566,6 +627,22 @@ export function JourneysPage() {
           setShowDeleteAll(false);
         }}
         onCancel={() => setShowDeleteAll(false)}
+      />
+
+      <ConfirmDialog
+        open={pendingJourneyDelete !== null}
+        title="Delete this journey?"
+        message={`"${pendingJourneyDelete?.title ?? ''}" and any tasks under it will be permanently removed. Other journeys are unaffected. This cannot be undone.`}
+        detail={`Cascading delete: 1 journey + its tasks`}
+        confirmLabel="Delete journey"
+        variant="destructive"
+        onConfirm={async () => {
+          if (pendingJourneyDelete) {
+            await deleteJourney(pendingJourneyDelete.id);
+            setPendingJourneyDelete(null);
+          }
+        }}
+        onCancel={() => setPendingJourneyDelete(null)}
       />
     </motion.div>
   );

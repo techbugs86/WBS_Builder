@@ -152,6 +152,32 @@ export async function syncProjectToClickUp(
   const folderName = `${project.name}${project.client ? ` — ${project.client}` : ''}`;
   let folderId = await getMapping(project.id, 'folder', project.id);
 
+  // Validate the cached folder mapping is still alive in ClickUp. If the user
+  // archived/trashed the folder in the ClickUp UI, our cached ID points to a
+  // ghost — list-creates inside it appear to succeed (ClickUp doesn't validate)
+  // but task-creates fail with "List deleted." Catch this up front and fall
+  // through to adopt-by-name / fresh-create instead of marching into the wall.
+  if (folderId) {
+    const check = await clickupRequest<{ id: string; archived?: boolean }>(
+      `/folder/${folderId}`,
+      { method: 'GET', projectId: project.id, apiKey },
+    );
+    const isMissing = !check.ok || check.status === 404;
+    const isArchived = check.ok && check.data?.archived === true;
+    if (isMissing || isArchived) {
+      log.push({
+        timestamp: ts(),
+        message: `↻ Cached folder ${folderId} is ${isArchived ? 'archived' : 'missing'} in ClickUp — clearing stale mappings and re-creating.`,
+        type: 'info',
+      });
+      // Wipe our stale folder + list mappings for this project so the next
+      // steps create fresh ones. Task mappings remain so we don't re-push
+      // tasks that were already created in OTHER folders (unlikely but safe).
+      await execute('DELETE FROM clickup_mappings WHERE project_id = ? AND entity_type IN (\'folder\', \'list\')', [project.id]);
+      folderId = null;
+    }
+  }
+
   // Adopt-by-name: if our mapping is missing (e.g. project deleted+recreated, or
   // first sync after tests cleared the DB) but ClickUp still has a folder with
   // this exact name, reuse it. Avoids the "Folder name taken" 400 from POST.
@@ -229,22 +255,74 @@ export async function syncProjectToClickUp(
     });
   }
 
-  // Fetch all existing lists in this folder ONCE so we can adopt-by-name
-  // instead of failing when an epic's title matches a list left over from
-  // a previous sync (we deleted our mappings during bulk-delete but ClickUp
-  // still has the lists). One API call per sync — much cheaper than one
-  // per-list "create + handle 'name taken' error" round-trip.
+  // Fetch all existing lists in this folder — both live and archived — so we
+  // can:
+  //   1. Validate cached list mappings against what's actually live.
+  //   2. Adopt-by-name when the title matches an existing live list.
+  //   3. UNARCHIVE a trashed list when the user wants to re-sync — ClickUp's
+  //      "name taken" check spans live + archived, so we MUST recover archived
+  //      lists rather than try to create new ones with the same title.
   const existingListsByName = new Map<string, string>();
+  const archivedListsByName = new Map<string, string>();
+  const liveListIds = new Set<string>();
   {
-    const listsRes = await clickupRequest<{ lists: Array<{ id: string; name: string }> }>(
+    const listsRes = await clickupRequest<{ lists: Array<{ id: string; name: string; archived?: boolean }> }>(
       `/folder/${folderId}/list`,
       { method: 'GET', projectId: project.id, apiKey },
     );
     if (listsRes.ok && Array.isArray(listsRes.data?.lists)) {
       for (const l of listsRes.data!.lists) {
+        if (l.archived) continue;
         existingListsByName.set(l.name, l.id);
+        liveListIds.add(l.id);
       }
     }
+    // Separate fetch for archived lists. ClickUp's default GET excludes them.
+    const archivedRes = await clickupRequest<{ lists: Array<{ id: string; name: string }> }>(
+      `/folder/${folderId}/list?archived=true`,
+      { method: 'GET', projectId: project.id, apiKey },
+    );
+    if (archivedRes.ok && Array.isArray(archivedRes.data?.lists)) {
+      for (const l of archivedRes.data!.lists) {
+        archivedListsByName.set(l.name, l.id);
+      }
+    }
+  }
+
+  async function unarchiveList(listId: string): Promise<boolean> {
+    const res = await clickupRequest<{ id: string }>(`/list/${listId}`, {
+      method: 'PUT',
+      body: { archived: false },
+      projectId: project.id,
+      apiKey,
+    });
+    return res.ok;
+  }
+
+  // Pre-flight: prune any cached list mappings that point to dead lists.
+  // Without this, the sync trusts the stale ID, "Reuses" the list, and every
+  // task-create then 400s with "List deleted." Wipe the bad rows so the
+  // adopt-by-name / fresh-create path below can recover automatically.
+  const cachedListRows = await query<{ entity_key: string; clickup_id: string }>(
+    'SELECT entity_key, clickup_id FROM clickup_mappings WHERE project_id = ? AND entity_type = \'list\'',
+    [project.id],
+  );
+  let prunedCount = 0;
+  for (const row of cachedListRows) {
+    if (!liveListIds.has(row.clickup_id)) {
+      await execute(
+        'DELETE FROM clickup_mappings WHERE project_id = ? AND entity_type = \'list\' AND entity_key = ?',
+        [project.id, row.entity_key],
+      );
+      prunedCount++;
+    }
+  }
+  if (prunedCount > 0) {
+    log.push({
+      timestamp: ts(),
+      message: `↻ Pruned ${prunedCount} stale list mapping(s) — their ClickUp lists were deleted/archived. Will recreate.`,
+      type: 'info',
+    });
   }
 
   for (const epicId of usedEpicIds) {
@@ -264,6 +342,20 @@ export async function syncProjectToClickUp(
       log.push({ timestamp: ts(), message: `↻ Adopted existing list "${epic.title}" (${listId})`, type: 'info' });
     }
 
+    // Restore-from-archive: ClickUp's "name taken" check spans archived lists,
+    // so trying to POST a new list with the same name will fail. Instead, find
+    // the archived list by name and unarchive it. Mirrors how a user would
+    // restore from the ClickUp trash UI.
+    if (!listId && archivedListsByName.has(epic.title)) {
+      const archivedId = archivedListsByName.get(epic.title)!;
+      const restored = await unarchiveList(archivedId);
+      if (restored) {
+        listId = archivedId;
+        await setMapping(project.id, 'list', epic.epicKey, listId);
+        log.push({ timestamp: ts(), message: `↻ Restored archived list "${epic.title}" (${listId})`, type: 'info' });
+      }
+    }
+
     if (!listId) {
       const res = await clickupRequest<{ id: string }>(`/folder/${folderId}/list`, {
         method: 'POST',
@@ -274,7 +366,8 @@ export async function syncProjectToClickUp(
       if (!res.ok || !res.data?.id) {
         // Fallback: ClickUp says "name taken" but our pre-fetch missed it
         // (race condition or eventual consistency). Re-fetch the folder's
-        // lists, find ours by name, adopt it.
+        // lists — both live and archived — find ours by name, adopt or
+        // unarchive as needed.
         if (res.error && /name taken/i.test(res.error)) {
           const refresh = await clickupRequest<{ lists: Array<{ id: string; name: string }> }>(
             `/folder/${folderId}/list`,
@@ -285,6 +378,18 @@ export async function syncProjectToClickUp(
             listId = found.id;
             await setMapping(project.id, 'list', epic.epicKey, listId);
             log.push({ timestamp: ts(), message: `↻ Adopted existing list "${epic.title}" (${listId}) after name conflict`, type: 'info' });
+          } else {
+            // Look in archived too — name conflict could be from a trashed list.
+            const archRefresh = await clickupRequest<{ lists: Array<{ id: string; name: string }> }>(
+              `/folder/${folderId}/list?archived=true`,
+              { method: 'GET', projectId: project.id, apiKey },
+            );
+            const archFound = archRefresh.data?.lists?.find((l) => l.name === epic.title);
+            if (archFound?.id && (await unarchiveList(archFound.id))) {
+              listId = archFound.id;
+              await setMapping(project.id, 'list', epic.epicKey, listId);
+              log.push({ timestamp: ts(), message: `↻ Restored archived list "${epic.title}" (${listId}) after name conflict`, type: 'info' });
+            }
           }
         }
         if (!listId) {

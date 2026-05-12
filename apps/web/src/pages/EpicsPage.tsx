@@ -41,11 +41,15 @@ function EpicRow({
   index,
   isUpdated,
   onEdit,
+  onDelete,
+  canDelete,
 }: {
   epicWithHistory: EpicWithHistory;
   index: number;
   isUpdated: boolean;
   onEdit: () => void;
+  onDelete: () => void;
+  canDelete: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const setEpicStatus = useProjectStore((s) => s.setEpicStatus);
@@ -141,6 +145,18 @@ function EpicRow({
             className="shrink-0 text-xs"
           >
             Revoke
+          </Button>
+        )}
+
+        {canDelete && (
+          <Button
+            size="icon-sm"
+            variant="destructive"
+            onClick={onDelete}
+            title="Delete this epic (also removes its journeys + tasks)"
+            className="shrink-0"
+          >
+            <Trash2 size={12} />
           </Button>
         )}
       </div>
@@ -258,12 +274,17 @@ export function EpicsPage() {
   const epicsWithHistory = useProjectStore((s) => s.epics);
   const approveAllEpics = useProjectStore((s) => s.approveAllEpics);
   const deleteAllEpics = useProjectStore((s) => s.deleteAllEpics);
+  const deleteEpic = useProjectStore((s) => s.deleteEpic);
   const regenState = useProjectStore((s) => s.regenState);
   const generateEpics = useProjectStore((s) => s.generateEpics);
   const isGenerating = useProjectStore((s) => s.isGenerating);
   const currentUser = useProjectStore((s) => s.currentUser);
-  const canDelete = currentUser?.role === 'admin' || currentUser?.role === 'owner';
+  // All authenticated org members can delete — see middleware/requireRole.ts
+  const canDelete = Boolean(currentUser);
   const [showDeleteAll, setShowDeleteAll] = useState(false);
+  // Per-epic delete dialog. Stores the epic's data so the confirm dialog can
+  // show its title + cascade-warning copy.
+  const [pendingEpicDelete, setPendingEpicDelete] = useState<{ id: string; title: string } | null>(null);
   // Project hydration handled by <ProjectWorkspace> — no loadProject here.
 
   const [selectedEpicId, setSelectedEpicId] = useState<string | null>(null);
@@ -388,6 +409,8 @@ export function EpicsPage() {
                     index={i}
                     isUpdated={regenState.affectedIds.includes(epicH.current.id)}
                     onEdit={() => setSelectedEpicId(epicH.current.id)}
+                    onDelete={() => setPendingEpicDelete({ id: epicH.current.id, title: epicH.current.title })}
+                    canDelete={canDelete}
                   />
                 ))}
               </div>
@@ -447,6 +470,22 @@ export function EpicsPage() {
           setShowDeleteAll(false);
         }}
         onCancel={() => setShowDeleteAll(false)}
+      />
+
+      <ConfirmDialog
+        open={pendingEpicDelete !== null}
+        title="Delete this epic?"
+        message={`"${pendingEpicDelete?.title ?? ''}" and any journeys + tasks under it will be permanently removed. Other epics are unaffected. This cannot be undone.`}
+        detail={`Cascading delete: 1 epic + its journeys + its tasks`}
+        confirmLabel="Delete epic"
+        variant="destructive"
+        onConfirm={async () => {
+          if (pendingEpicDelete) {
+            await deleteEpic(pendingEpicDelete.id);
+            setPendingEpicDelete(null);
+          }
+        }}
+        onCancel={() => setPendingEpicDelete(null)}
       />
     </motion.div>
   );

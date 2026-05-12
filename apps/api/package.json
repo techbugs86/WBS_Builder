@@ -8,7 +8,10 @@
     "build": "tsc -b",
     "start": "node dist/index.js",
     "start:test": "node --env-file=.env.test dist/index.js",
-    "seed:test": "node --env-file=.env.test dist/db/seed.js",
+    "seed": "tsx src/db/seed.ts",
+    "seed:test": "tsx --env-file=.env.test src/db/seed.ts",
+    "migrate": "tsx src/db/migrate.cli.ts",
+    "migrate:test": "tsx --env-file=.env.test src/db/migrate.cli.ts",
     "test": "vitest run"
   },
   "dependencies": {

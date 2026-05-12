@@ -116,16 +116,79 @@ export function ProjectDefinitionPage() {
   const deleteProject = useProjectStore((s) => s.deleteProject);
   const currentUser = useProjectStore((s) => s.currentUser);
 
-  const canDelete = currentUser?.role === 'admin' || currentUser?.role === 'owner';
+  // All authenticated org members can delete — see middleware/requireRole.ts
+  const canDelete = Boolean(currentUser);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [saveError, setSaveError] = useState<string | null>(null);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  // Track which fields the user has interacted with — validation messages
+  // appear on blur (and on Save attempt), not while the user is mid-typing.
+  const [touched, setTouched] = useState<Record<string, boolean>>({});
+  const markTouched = (field: string) => setTouched((t) => ({ ...t, [field]: true }));
   // Project hydration handled by <ProjectWorkspace> — no loadProject here.
+
+  // Validation. Mirror the rules from NewProjectPage so a project edited here
+  // can't end up with values it couldn't have been created with.
+  //
+  // Note: channel reference fields are deliberately NOT validated as URLs.
+  // Per CHANNEL_PLACEHOLDERS, each channel takes freeform text (Upwork
+  // contract ID, email subject, Slack channel name, meeting notes, etc.)
+  // — not just URLs. Forcing https://... was wrong.
+
+  const errors = {
+    name:
+      definition.name.trim().length === 0
+        ? 'Project name is required.'
+        : definition.name.trim().length < 3
+        ? 'Use at least 3 characters.'
+        : definition.name.trim().length > 80
+        ? 'Keep it under 80 characters.'
+        : null,
+    client:
+      definition.client.trim().length === 0
+        ? 'Client name is required.'
+        : definition.client.trim().length < 2
+        ? 'Use at least 2 characters.'
+        : definition.client.trim().length > 80
+        ? 'Keep it under 80 characters.'
+        : null,
+    estimatedBudget:
+      definition.estimatedBudget.trim().length > 0 && !/\d/.test(definition.estimatedBudget)
+        ? 'Budget should include a number (e.g. "$50,000").'
+        : null,
+    contactPerson:
+      definition.contactPerson.trim().length === 0
+        ? 'Contact person is required.'
+        : definition.contactPerson.trim().length < 2
+        ? 'Use at least 2 characters.'
+        : null,
+  } as const;
+  // No per-channel validation — references are freeform.
+  const channelLinkErrors: Partial<Record<CommunicationChannel, string>> = {};
+  const hasAnyError = Boolean(
+    errors.name || errors.client || errors.estimatedBudget || errors.contactPerson,
+  );
 
   async function handleSave() {
     if (!projectId || saveStatus === 'saving') return;
+    // Validate before save — surface ALL errors at once if any are present
+    // so the user sees everything they need to fix in one pass.
+    if (hasAnyError) {
+      setTouched({
+        name: true,
+        client: true,
+        estimatedBudget: true,
+        contactPerson: true,
+        ...Object.fromEntries(
+          (definition.communicationChannels ?? []).map((ch) => [`channelLink:${ch}`, true]),
+        ),
+      });
+      setSaveStatus('error');
+      setSaveError('Please fix the highlighted fields before saving.');
+      return;
+    }
     setSaveStatus('saving');
     setSaveError(null);
     try {
@@ -245,24 +308,32 @@ export function ProjectDefinitionPage() {
           <h2 className={sectionHeadingCls} style={sectionHeadingStyle}>Project Info</h2>
           <div className="space-y-4">
             <div>
-              <label className={labelCls} style={labelStyle}>Project Name</label>
+              <label className={labelCls} style={labelStyle}>Project Name <span className="text-red-400">*</span></label>
               <input
                 type="text"
                 value={definition.name}
                 onChange={(e) => setDefinitionField('name', e.target.value)}
+                onBlur={() => markTouched('name')}
                 className={inputCls}
-                style={inputStyle}
+                style={{ ...inputStyle, border: `1px solid ${touched['name'] && errors.name ? 'rgb(248,113,113)' : 'var(--border)'}` }}
               />
+              {touched['name'] && errors.name && (
+                <p className="text-[11px] mt-1.5 text-red-400 flex items-center gap-1"><span aria-hidden>•</span>{errors.name}</p>
+              )}
             </div>
             <div>
-              <label className={labelCls} style={labelStyle}>Client Name</label>
+              <label className={labelCls} style={labelStyle}>Client Name <span className="text-red-400">*</span></label>
               <input
                 type="text"
                 value={definition.client}
                 onChange={(e) => setDefinitionField('client', e.target.value)}
+                onBlur={() => markTouched('client')}
                 className={inputCls}
-                style={inputStyle}
+                style={{ ...inputStyle, border: `1px solid ${touched['client'] && errors.client ? 'rgb(248,113,113)' : 'var(--border)'}` }}
               />
+              {touched['client'] && errors.client && (
+                <p className="text-[11px] mt-1.5 text-red-400 flex items-center gap-1"><span aria-hidden>•</span>{errors.client}</p>
+              )}
             </div>
             <div>
               <label className={labelCls} style={labelStyle}>Project Type</label>
@@ -279,10 +350,14 @@ export function ProjectDefinitionPage() {
                   type="text"
                   value={definition.estimatedBudget}
                   onChange={(e) => setDefinitionField('estimatedBudget', e.target.value)}
+                  onBlur={() => markTouched('estimatedBudget')}
                   placeholder="e.g. $50,000"
                   className={inputCls}
-                  style={inputStyle}
+                  style={{ ...inputStyle, border: `1px solid ${touched['estimatedBudget'] && errors.estimatedBudget ? 'rgb(248,113,113)' : 'var(--border)'}` }}
                 />
+                {touched['estimatedBudget'] && errors.estimatedBudget && (
+                  <p className="text-[11px] mt-1.5 text-red-400 flex items-center gap-1"><span aria-hidden>•</span>{errors.estimatedBudget}</p>
+                )}
               </div>
               <div>
                 <label className={labelCls} style={labelStyle}>Start Date</label>
@@ -340,22 +415,30 @@ export function ProjectDefinitionPage() {
                   type="text"
                   value={definition.channelLinks?.[ch] ?? ''}
                   onChange={(e) => setDefinitionField('channelLinks', { ...definition.channelLinks, [ch]: e.target.value })}
+                  onBlur={() => markTouched(`channelLink:${ch}`)}
                   placeholder={CHANNEL_PLACEHOLDERS[ch]}
                   className={inputCls}
-                  style={inputStyle}
+                  style={{ ...inputStyle, border: `1px solid ${touched[`channelLink:${ch}`] && channelLinkErrors[ch] ? 'rgb(248,113,113)' : 'var(--border)'}` }}
                 />
+                {touched[`channelLink:${ch}`] && channelLinkErrors[ch] && (
+                  <p className="text-[11px] mt-1.5 text-red-400 flex items-center gap-1"><span aria-hidden>•</span>{channelLinkErrors[ch]}</p>
+                )}
               </div>
             ))}
             <div>
-              <label className={labelCls} style={labelStyle}>Contact Person</label>
+              <label className={labelCls} style={labelStyle}>Contact Person <span className="text-red-400">*</span></label>
               <input
                 type="text"
                 value={definition.contactPerson}
                 onChange={(e) => setDefinitionField('contactPerson', e.target.value)}
+                onBlur={() => markTouched('contactPerson')}
                 placeholder="e.g. Sarah Johnson"
                 className={inputCls}
-                style={inputStyle}
+                style={{ ...inputStyle, border: `1px solid ${touched['contactPerson'] && errors.contactPerson ? 'rgb(248,113,113)' : 'var(--border)'}` }}
               />
+              {touched['contactPerson'] && errors.contactPerson && (
+                <p className="text-[11px] mt-1.5 text-red-400 flex items-center gap-1"><span aria-hidden>•</span>{errors.contactPerson}</p>
+              )}
             </div>
             <div>
               <label className={labelCls} style={labelStyle}>AI Provider</label>
