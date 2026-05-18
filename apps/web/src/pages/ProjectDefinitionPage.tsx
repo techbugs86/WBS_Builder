@@ -1,4 +1,4 @@
-import { useRef, useCallback, useState } from 'react';
+import { useRef, useCallback, useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -16,8 +16,11 @@ import {
   Trash2,
 } from 'lucide-react';
 import { useProjectStore } from '../store/useProjectStore';
+import { useAvailableProviders } from '../hooks/useAvailableProviders';
 import { Button } from '../components/ui/button';
 import { ConfirmDialog } from '../components/ConfirmDialog';
+import { ChatSidebarColumn, ShowChatButton } from '../components/ChatSidebarColumn';
+import { useChatSidebar } from '../hooks/useChatSidebar';
 import type { CommunicationChannel } from '../constants/enums';
 import {
   PROJECT_TYPE_VALUES_SELECTABLE,
@@ -115,9 +118,22 @@ export function ProjectDefinitionPage() {
   const saveProject = useProjectStore((s) => s.saveProject);
   const deleteProject = useProjectStore((s) => s.deleteProject);
   const currentUser = useProjectStore((s) => s.currentUser);
+  const { providers: availableProviders, loading: loadingProviders } = useAvailableProviders();
+  const chatSidebar = useChatSidebar('definition');
+  const chatMessageCount = useProjectStore((s) => (projectId ? s.definitionChat[projectId]?.length ?? 0 : 0));
 
   // All authenticated org members can delete — see middleware/requireRole.ts
   const canDelete = Boolean(currentUser);
+
+  // Reconcile stored provider with what's actually configured. If the saved
+  // project pinned a provider whose API key has since been removed, fall back
+  // to the first available one so generations don't fail later.
+  useEffect(() => {
+    if (loadingProviders || availableProviders.length === 0) return;
+    if (!availableProviders.includes(definition.provider)) {
+      setDefinitionField('provider', availableProviders[0]!);
+    }
+  }, [availableProviders, loadingProviders, definition.provider, setDefinitionField]);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
@@ -226,8 +242,9 @@ export function ProjectDefinitionPage() {
   }
 
   return (
+    <div className="flex h-full">
     <motion.div
-      className="px-8 py-10 h-full overflow-y-auto relative"
+      className="flex-1 min-w-0 px-8 py-10 overflow-y-auto relative"
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.2 }}
@@ -298,6 +315,7 @@ export function ProjectDefinitionPage() {
                 Delete
               </Button>
             )}
+            <ShowChatButton hidden={chatSidebar.hidden} onShow={chatSidebar.show} count={chatMessageCount} />
           </div>
         </div>
       </div>
@@ -442,25 +460,48 @@ export function ProjectDefinitionPage() {
             </div>
             <div>
               <label className={labelCls} style={labelStyle}>AI Provider</label>
-              <div
-                className="flex items-center gap-1 rounded-lg p-1 w-fit"
-                style={{ background: 'linear-gradient(135deg, var(--bg-card), var(--bg-card-alt))', border: '1px solid var(--border)' }}
-              >
-                {(['anthropic', 'openai'] as const).map((p) => (
-                  <button
-                    key={p}
-                    onClick={() => setDefinitionField('provider', p)}
-                    className="px-4 py-2 rounded-md text-xs font-medium transition-all duration-150 cursor-pointer"
-                    style={
-                      definition.provider === p
-                        ? { background: 'rgba(124,58,237,0.2)', color: 'var(--accent-text)', border: '1px solid rgba(124,58,237,0.4)' }
-                        : { color: 'var(--text-muted)', border: '1px solid transparent' }
-                    }
-                  >
-                    {p === 'anthropic' ? 'Anthropic' : 'OpenAI'}
-                  </button>
-                ))}
-              </div>
+              {availableProviders.length >= 2 ? (
+                <div
+                  className="flex items-center gap-1 rounded-lg p-1 w-fit"
+                  style={{ background: 'linear-gradient(135deg, var(--bg-card), var(--bg-card-alt))', border: '1px solid var(--border)' }}
+                >
+                  {availableProviders.map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => setDefinitionField('provider', p)}
+                      className="px-4 py-2 rounded-md text-xs font-medium transition-all duration-150 cursor-pointer"
+                      style={
+                        definition.provider === p
+                          ? { background: 'rgba(124,58,237,0.2)', color: 'var(--accent-text)', border: '1px solid rgba(124,58,237,0.4)' }
+                          : { color: 'var(--text-muted)', border: '1px solid transparent' }
+                      }
+                    >
+                      {p === 'anthropic' ? 'Anthropic' : 'OpenAI'}
+                    </button>
+                  ))}
+                </div>
+              ) : availableProviders.length === 1 ? (
+                <div
+                  className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-xs"
+                  style={{ background: 'linear-gradient(135deg, var(--bg-card), var(--bg-card-alt))', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
+                >
+                  <span
+                    className="w-1.5 h-1.5 rounded-full"
+                    style={{ background: availableProviders[0] === 'anthropic' ? '#f97316' : '#10b981' }}
+                  />
+                  <span className="font-medium">
+                    {availableProviders[0] === 'anthropic' ? 'Anthropic' : 'OpenAI'}
+                  </span>
+                  <span style={{ color: 'var(--text-dim)' }}>· only configured provider</span>
+                </div>
+              ) : !loadingProviders ? (
+                <div
+                  className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-xs"
+                  style={{ background: 'var(--warning-bg)', border: '1px solid var(--warning-border)', color: 'var(--warning-text)' }}
+                >
+                  No AI provider configured — set an API key in Admin → Integrations.
+                </div>
+              ) : null}
             </div>
           </div>
         </section>
@@ -594,5 +635,17 @@ export function ProjectDefinitionPage() {
         onCancel={() => setShowDeleteDialog(false)}
       />
     </motion.div>
+
+    {/* Chat rail — hide/show + horizontal resize via useChatSidebar */}
+    <ChatSidebarColumn
+      projectId={projectId}
+      stage="definition"
+      hidden={chatSidebar.hidden}
+      width={chatSidebar.width}
+      isResizing={chatSidebar.isResizing}
+      onHide={chatSidebar.hide}
+      onResizeStart={chatSidebar.onResizeStart}
+    />
+    </div>
   );
 }

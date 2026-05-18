@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import { ZodError } from 'zod';
+import { logErrorFireAndForget } from '../lib/errorLog.js';
 
 /**
  * Global error-handling middleware. MUST be registered LAST in app.ts after
@@ -15,7 +16,7 @@ import { ZodError } from 'zod';
  */
 export function errorHandler(
   err: unknown,
-  _req: Request,
+  req: Request,
   res: Response,
   _next: NextFunction,
 ): void {
@@ -56,6 +57,25 @@ export function errorHandler(
     status,
     code,
     message,
+    stack: err instanceof Error ? err.stack : undefined,
+  });
+
+  // Persist to the central error-log file. 4xx errors are usually user/input
+  // mistakes (validation, missing body) — log as warn. 5xx is something
+  // unexpected; log as error so admin viewers can filter to real failures.
+  logErrorFireAndForget({
+    level: status >= 500 ? 'error' : 'warn',
+    source: 'backend',
+    module: `route:${req.method} ${req.path}`,
+    message,
+    context: {
+      status,
+      code,
+      method: req.method,
+      url: req.originalUrl,
+      params: req.params,
+      userId: (req as Request & { user?: { userId?: string } }).user?.userId,
+    },
     stack: err instanceof Error ? err.stack : undefined,
   });
 

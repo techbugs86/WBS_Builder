@@ -6,9 +6,12 @@ import { requireOrgProject } from '../middleware/requireOrgProject.js';
 import { requireRole } from '../middleware/requireRole.js';
 import { asyncHandler } from '../middleware/asyncHandler.js';
 import { HttpError } from '../middleware/errorHandler.js';
-import { generateBrief, generateEpics, generateJourneys, generateTasks, rewriteItem, type Brief, type Epic, type Journey } from '../ai/index.js';
+import { generateBrief, generateEpics, generateEpicsForTier, generateJourneys, generateJourneysForEpic, generateTasks, rewriteItem, chatAboutEpics, chatAboutJourneys, chatAboutTasks, chatAboutBrief, chatAboutDefinition, chatAboutSync, generateOneEpic, generateOneJourney, generateOneTask, previewProject, previewStage, type Brief, type Epic, type Journey, type RewriteContext } from '../ai/index.js';
 import { syncProjectToClickUp } from '../clickup/sync.js';
 import { SELECTABLE_PROJECT_TYPES } from '../constants/enums.js';
+import { sortEpicsByPriority } from '../lib/sortEpics.js';
+import { extractAttachmentText } from '../lib/attachmentExtractor.js';
+import multer from 'multer';
 
 function safeJsonParse<T>(raw: unknown, fallback: T): T {
   if (typeof raw !== 'string') return (raw as T) ?? fallback;
@@ -49,11 +52,67 @@ interface ProjectRow {
   channel_link: string;
   contact_person: string;
   raw_input: string;
+  attachments_text: string | null;
   provider: string;
   status: string;
   created_by: string;
   created_at: string;
   updated_at: string;
+}
+
+interface ProjectAttachmentRow {
+  id: string;
+  project_id: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  status: 'pending' | 'ok' | 'failed';
+  extracted_chars: number;
+  error_message: string | null;
+  created_at: string;
+}
+
+// In-memory multer — files are extracted then dropped (we only persist the
+// extracted text). 10 MB per file, max 5 files per request.
+const ATTACHMENT_UPLOAD_LIMITS = { fileSize: 10 * 1024 * 1024, files: 5 };
+const attachmentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: ATTACHMENT_UPLOAD_LIMITS,
+});
+
+/**
+ * Combines raw_input + attachments_text into one source string for the brief
+ * extractor. Attachment text is fenced with a header so the LLM can tell the
+ * two apart (and won't hallucinate that "the attached PRD says X" when the
+ * user only pasted notes).
+ */
+export function combinedSourceText(rawInput: string, attachmentsText: string | null): string {
+  const raw = (rawInput ?? '').trim();
+  const att = (attachmentsText ?? '').trim();
+  if (!att) return raw;
+  if (!raw) return `--- ATTACHED DOCUMENTS ---\n${att}`;
+  return `${raw}\n\n--- ATTACHED DOCUMENTS ---\n${att}`;
+}
+
+/**
+ * Rebuilds projects.attachments_text by concatenating the extracted text of
+ * every `ok` attachment in created_at order. Called after each successful
+ * upload and after every delete so the brief generator always sees the
+ * current set.
+ */
+async function rebuildAttachmentsText(projectId: string): Promise<void> {
+  // We store extracted text per attachment in the project_attachments table?
+  // No — only on the project row. To rebuild we keep a parallel column.
+  // Simpler: track extracted text on the attachment row too, then concat.
+  const rows = await query<ProjectAttachmentRow & { extracted_text: string | null }>(
+    "SELECT id, filename, extracted_text FROM project_attachments WHERE project_id = ? AND status = 'ok' ORDER BY created_at ASC",
+    [projectId],
+  );
+  const combined = rows
+    .map((r) => `--- FILE: ${r.filename} ---\n${(r.extracted_text ?? '').trim()}`)
+    .filter((b) => b.trim().length > 0)
+    .join('\n\n');
+  await execute('UPDATE projects SET attachments_text = ? WHERE id = ?', [combined || null, projectId]);
 }
 
 interface BriefRow {
@@ -331,6 +390,98 @@ projectsRouter.delete('/:id', requireRole('admin'), asyncHandler(async (req, res
   res.json({ deleted: true, id: projectId });
 }));
 
+// ─── Attachments (project intake docs) ──────────────────────────────────────
+// Uploaded files (PDF / DOCX / TXT / MD / image) are extracted to text and
+// concatenated alongside raw_input when the brief is generated. We only
+// persist the extracted text, never the original binary.
+
+// GET /projects/:id/attachments — list metadata so the UI can show current files.
+projectsRouter.get('/:id/attachments', asyncHandler(async (req, res) => {
+  const rows = await query<ProjectAttachmentRow>(
+    'SELECT id, project_id, filename, mime_type, size_bytes, status, extracted_chars, error_message, created_at FROM project_attachments WHERE project_id = ? ORDER BY created_at ASC',
+    [req.params['id']],
+  );
+  res.json({ attachments: rows });
+}));
+
+// POST /projects/:id/attachments — multipart upload, runs extraction inline.
+// Field name: "files" (one or more). Returns the inserted attachment rows
+// with extraction status so the UI can show ok/failed per file.
+projectsRouter.post(
+  '/:id/attachments',
+  attachmentUpload.array('files', ATTACHMENT_UPLOAD_LIMITS.files),
+  asyncHandler(async (req, res) => {
+    const project = req.project as unknown as ProjectRow;
+    const files = (req.files as Express.Multer.File[] | undefined) ?? [];
+    if (files.length === 0) {
+      res.status(400).json({ error: 'No files received. Use multipart field "files".' });
+      return;
+    }
+
+    const provider = (project.provider === 'openai' ? 'openai' : 'anthropic') as 'anthropic' | 'openai';
+    const inserted: ProjectAttachmentRow[] = [];
+
+    for (const file of files) {
+      const id = uuid();
+      let status: 'ok' | 'failed' = 'ok';
+      let extractedText = '';
+      let errorMessage: string | null = null;
+
+      try {
+        extractedText = await extractAttachmentText(file.buffer, file.originalname, file.mimetype, provider);
+      } catch (err) {
+        status = 'failed';
+        errorMessage = err instanceof Error ? err.message.slice(0, 480) : 'Unknown extraction error.';
+        console.warn(`[attachments] extraction failed for "${file.originalname}":`, errorMessage);
+      }
+
+      await execute(
+        'INSERT INTO project_attachments (id, project_id, filename, mime_type, size_bytes, status, extracted_chars, extracted_text, error_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        [
+          id,
+          req.params['id'],
+          file.originalname.slice(0, 250),
+          file.mimetype.slice(0, 120),
+          file.size,
+          status,
+          extractedText.length,
+          status === 'ok' ? extractedText : null,
+          errorMessage,
+        ],
+      );
+
+      inserted.push({
+        id,
+        project_id: req.params['id'] as string,
+        filename: file.originalname,
+        mime_type: file.mimetype,
+        size_bytes: file.size,
+        status,
+        extracted_chars: extractedText.length,
+        error_message: errorMessage,
+        created_at: new Date().toISOString(),
+      });
+    }
+
+    await rebuildAttachmentsText(req.params['id'] as string);
+    res.json({ attachments: inserted });
+  }),
+);
+
+// DELETE /projects/:id/attachments/:attachmentId — drop one file, rebuild
+// the project's attachments_text so the brief generator stops seeing it.
+projectsRouter.delete('/:id/attachments/:attachmentId', asyncHandler(async (req, res) => {
+  const result = await execute(
+    'DELETE FROM project_attachments WHERE id = ? AND project_id = ?',
+    [req.params['attachmentId'], req.params['id']],
+  );
+  // mysql2 result.affectedRows tells us whether the file existed
+  const affected = (result as unknown as { affectedRows: number }).affectedRows ?? 0;
+  if (affected === 0) { res.status(404).json({ error: 'Attachment not found.' }); return; }
+  await rebuildAttachmentsText(req.params['id'] as string);
+  res.json({ deleted: true });
+}));
+
 // ─── Brief ────────────────────────────────────────────────────────────────────
 
 // GET /projects/:id/brief
@@ -352,6 +503,37 @@ projectsRouter.get('/:id/brief', async (req, res) => {
   });
 });
 
+// GET /projects/:id/brief/preview — short AI-generated project description
+// shown on the empty Brief page. Does NOT write to the DB. Cheap LLM call.
+projectsRouter.get('/:id/brief/preview', asyncHandler(async (req, res) => {
+  const project = req.project as unknown as ProjectRow;
+  const source = combinedSourceText(project.raw_input ?? '', project.attachments_text);
+  const summary = await previewProject(
+    project.provider as 'anthropic' | 'openai',
+    project.name ?? '',
+    project.client ?? '',
+    source,
+  );
+  res.json({ summary });
+}));
+
+// GET /projects/:id/:stage/preview — short AI preview for any pipeline stage.
+// stage ∈ epics | journeys | tasks | sync. Reads brief for context.
+projectsRouter.get('/:id/:stage(epics|journeys|tasks|sync)/preview', asyncHandler(async (req, res) => {
+  const project = req.project as unknown as ProjectRow;
+  const stage = req.params['stage'] as 'epics' | 'journeys' | 'tasks' | 'sync';
+
+  const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const brief = briefRow ? safeJsonParse<Brief>(briefRow.data, {} as Brief) : null;
+
+  const summary = await previewStage(project.provider as 'anthropic' | 'openai', stage, {
+    projectName: project.name ?? '',
+    client: project.client ?? '',
+    brief,
+  });
+  res.json({ summary });
+}));
+
 // POST /projects/:id/brief/generate
 projectsRouter.post('/:id/brief/generate', asyncHandler(async (req, res) => {
   const project = req.project as unknown as ProjectRow;
@@ -359,10 +541,15 @@ projectsRouter.post('/:id/brief/generate', asyncHandler(async (req, res) => {
   const { systemPrompt, userTemplate } = await getPromptConfig('brief_extraction', req.user!.orgId, promptType(project.project_type));
   const challengeText = (req.body as { challengeText?: string }).challengeText ?? '';
 
+  // Source text = raw_input + extracted attachments (concatenated). The
+  // brief extractor reads them as one document — same code path for typed
+  // notes and uploaded scope docs.
+  const source = combinedSourceText(project.raw_input ?? '', project.attachments_text);
+
   let brief;
   try {
     brief = await generateBrief(
-      project.raw_input ?? '',
+      source,
       project.name,
       project.client,
       project.provider as 'anthropic' | 'openai',
@@ -660,7 +847,7 @@ projectsRouter.delete('/:id/tasks/:taskKey', requireRole('admin'), asyncHandler(
 // GET /projects/:id/epics
 projectsRouter.get('/:id/epics', async (req, res) => {
   const currentRows = await query<EpicRow>(
-    'SELECT * FROM epics WHERE project_id = ? AND is_current = 1',
+    'SELECT * FROM epics WHERE project_id = ? AND is_current = 1 ORDER BY created_at ASC',
     [req.params['id']],
   );
   if (currentRows.length === 0) { res.json([]); return; }
@@ -692,28 +879,61 @@ projectsRouter.post('/:id/epics/generate', asyncHandler(async (req, res) => {
   const { systemPrompt, userTemplate } = await getPromptConfig('epic_generation', req.user!.orgId, promptType(project.project_type));
   const challengeText = (req.body as { challengeText?: string }).challengeText ?? '';
 
-  let epics;
-  try {
-    epics = await generateEpics(brief, project.provider as 'anthropic' | 'openai', systemPrompt, userTemplate, challengeText);
-  } catch (err) {
-    throw llmErrorToHttp(err);
-  }
-
-  // Deactivate all existing epics
+  // Deactivate existing epics upfront so polling returns an empty list while
+  // we're streaming in the new ones.
   await execute('UPDATE epics SET is_current = 0 WHERE project_id = ?', [req.params['id']]);
 
-  // Insert new epics
-  for (const epic of epics) {
-    const epicKey = epic.id;
+  // Stream epics tier-by-tier: 3 sequential LLM calls (foundation → core →
+  // supporting/growth). After each call we insert that tier's epics so the
+  // frontend polling picks them up — same UX as journey/task generation.
+  const provider = project.provider as 'anthropic' | 'openai';
+  const tiers: Array<'foundation' | 'core_value' | 'supporting_growth'> = ['foundation', 'core_value', 'supporting_growth'];
+  const all: Epic[] = [];
+
+  for (const tier of tiers) {
+    console.log(`[epics/generate] starting tier=${tier} (have ${all.length} so far)`);
+    let batch: Epic[];
+    try {
+      batch = await generateEpicsForTier(brief, provider, systemPrompt, challengeText, tier, all);
+    } catch (err) {
+      // If a single tier fails, log + continue. Other tiers may still succeed.
+      console.warn(`[epics/generate] tier=${tier} failed:`, err instanceof Error ? err.message : err);
+      continue;
+    }
+    console.log(`[epics/generate] tier=${tier} produced ${batch.length} epics`);
+    for (const epic of batch) {
+      await execute(
+        'INSERT INTO epics (id, project_id, epic_key, version, is_current, data, label) VALUES (?, ?, ?, 1, 1, ?, ?)',
+        [uuid(), req.params['id'], epic.id, JSON.stringify(epic), 'AI Generated v1'],
+      );
+    }
+    all.push(...batch);
+  }
+
+  // If every tier failed and we have zero epics, treat as a hard error.
+  if (all.length === 0) {
+    throw llmErrorToHttp(new Error('All epic tier generations failed. Check the AI provider key and try again.'));
+  }
+
+  // Re-sort the final list by priority. Inserts kept their original
+  // creation order so the SELECT ORDER BY created_at ASC respects tier
+  // order naturally — but if the LLM mis-tiered any epic, the deterministic
+  // sort catches it.
+  const sorted = sortEpicsByPriority(all);
+
+  // If sort changed the order, rewrite created_at so the SELECT order matches.
+  // Cheap — at most a few UPDATEs.
+  for (let i = 0; i < sorted.length; i++) {
+    const epicKey = sorted[i]!.id;
     await execute(
-      'INSERT INTO epics (id, project_id, epic_key, version, is_current, data, label) VALUES (?, ?, ?, 1, 1, ?, ?)',
-      [uuid(), req.params['id'], epicKey, JSON.stringify(epic), 'AI Generated v1'],
+      `UPDATE epics SET created_at = DATE_ADD(NOW(), INTERVAL ? MICROSECOND) WHERE project_id = ? AND epic_key = ? AND is_current = 1`,
+      [i, req.params['id'], epicKey],
     );
   }
 
   await execute('UPDATE projects SET updated_at = NOW() WHERE id = ?', [req.params['id']]);
 
-  const saved = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const saved = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1 ORDER BY created_at ASC', [req.params['id']]);
   res.json(saved.map((r) => ({
     current: typeof r.data === 'string' ? JSON.parse(r.data) : r.data,
     versions: [{ version: 1, label: 'AI Generated v1', challengeText: '', createdAt: r.created_at, data: typeof r.data === 'string' ? JSON.parse(r.data) : r.data }],
@@ -756,9 +976,29 @@ projectsRouter.post('/:id/epics/:epicKey/rewrite', asyncHandler(async (req, res)
   const instruction = (req.body as { instruction?: string }).instruction ?? '';
   const { systemPrompt } = await getPromptConfig('epic_generation', req.user!.orgId, promptType(project.project_type));
 
+  // Page context — brief + sibling epics so the rewrite stays consistent with
+  // the rest of the Epics page and doesn't drift into journey/task territory.
+  const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const briefData = briefRow ? safeJsonParse<Brief>(briefRow.data, {} as Brief) : null;
+  const siblingRows = await query<EpicRow>(
+    'SELECT * FROM epics WHERE project_id = ? AND is_current = 1 AND epic_key <> ?',
+    [req.params['id'], req.params['epicKey']],
+  );
+  const siblings = siblingRows.map((r) => {
+    const d = safeJsonParse<Record<string, unknown>>(r.data, {});
+    return {
+      title: typeof d['title'] === 'string' ? d['title'] : undefined,
+      summary: typeof d['description'] === 'string' ? d['description'].slice(0, 140) : undefined,
+    };
+  });
+  const context: RewriteContext = {
+    brief: briefData ? { summary: briefData.summary, scope: briefData.inScope, outOfScope: briefData.outOfScope } : null,
+    siblings,
+  };
+
   let rewritten;
   try {
-    rewritten = await rewriteItem('epic', currentData, instruction, project.provider as 'anthropic' | 'openai', systemPrompt);
+    rewritten = await rewriteItem('epic', currentData, instruction, project.provider as 'anthropic' | 'openai', systemPrompt, context);
   } catch (err) {
     throw llmErrorToHttp(err);
   }
@@ -772,6 +1012,180 @@ projectsRouter.post('/:id/epics/:epicKey/rewrite', asyncHandler(async (req, res)
 
   const versions = await query<EpicRow>('SELECT * FROM epics WHERE epic_key = ? ORDER BY version ASC', [req.params['epicKey']]);
   res.json({ current: rewritten, versions: toVersionHistory(versions) });
+}));
+
+// POST /projects/:id/brief/chat — conversational reply about the brief; may
+// return regenerate=<instruction> for full brief regen.
+projectsRouter.post('/:id/brief/chat', asyncHandler(async (req, res) => {
+  const project = req.project as unknown as ProjectRow;
+  const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  if (!briefRow) { res.status(400).json({ error: 'Generate a brief first.' }); return; }
+  const body = req.body as { message?: string; history?: { role: 'user' | 'agent'; text: string }[] };
+  const message = (body.message ?? '').trim();
+  if (!message) { res.status(400).json({ error: 'message is required.' }); return; }
+  const brief = safeJsonParse<Brief>(briefRow.data, {} as Brief);
+  const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
+  let result;
+  try { result = await chatAboutBrief(project.provider as 'anthropic' | 'openai', brief, message, history); }
+  catch (err) { throw llmErrorToHttp(err); }
+  res.json(result);
+}));
+
+// POST /projects/:id/definition/chat — advisory chat about the project setup form.
+projectsRouter.post('/:id/definition/chat', asyncHandler(async (req, res) => {
+  const project = req.project as unknown as ProjectRow;
+  const body = req.body as { message?: string; history?: { role: 'user' | 'agent'; text: string }[] };
+  const message = (body.message ?? '').trim();
+  if (!message) { res.status(400).json({ error: 'message is required.' }); return; }
+  const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
+  let result;
+  try {
+    result = await chatAboutDefinition(
+      project.provider as 'anthropic' | 'openai',
+      {
+        name: project.name ?? '',
+        client: project.client ?? '',
+        project_type: project.project_type ?? '',
+        estimated_budget: project.estimated_budget ?? '',
+        start_date: project.start_date ?? '',
+        raw_input: project.raw_input ?? '',
+        contact_person: project.contact_person ?? '',
+      },
+      message,
+      history,
+    );
+  } catch (err) { throw llmErrorToHttp(err); }
+  res.json(result);
+}));
+
+// POST /projects/:id/sync/chat — advisory chat about ClickUp sync state.
+projectsRouter.post('/:id/sync/chat', asyncHandler(async (req, res) => {
+  const project = req.project as unknown as ProjectRow;
+  const body = req.body as { message?: string; history?: { role: 'user' | 'agent'; text: string }[] };
+  const message = (body.message ?? '').trim();
+  if (!message) { res.status(400).json({ error: 'message is required.' }); return; }
+  const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
+
+  const taskRows = await query<TaskRow>('SELECT * FROM tasks WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const mappingRows = await query<{ entity_key: string; clickup_id: string }>(
+    "SELECT entity_key, clickup_id FROM clickup_mappings WHERE project_id = ? AND entity_type = 'task'",
+    [req.params['id']],
+  );
+  const syncedKeys = new Set(mappingRows.map((m) => m.entity_key));
+  const syncedCount = taskRows.filter((t) => syncedKeys.has(t.task_key)).length;
+
+  let result;
+  try {
+    result = await chatAboutSync(
+      project.provider as 'anthropic' | 'openai',
+      {
+        projectName: project.name ?? '(untitled)',
+        taskCount: taskRows.length,
+        syncedCount,
+        lastSyncedAt: null,
+        recentErrors: [],
+      },
+      message,
+      history,
+    );
+  } catch (err) { throw llmErrorToHttp(err); }
+  res.json(result);
+}));
+
+// POST /projects/:id/epics/chat — conversational reply about epics, no DB writes
+projectsRouter.post('/:id/epics/chat', asyncHandler(async (req, res) => {
+  const project = req.project as unknown as ProjectRow;
+
+  const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  if (!briefRow) { res.status(400).json({ error: 'Generate a brief first.' }); return; }
+
+  const epicRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1 ORDER BY created_at ASC', [req.params['id']]);
+
+  const body = req.body as { message?: string; history?: { role: 'user' | 'agent'; text: string }[] };
+  const message = (body.message ?? '').trim();
+  if (!message) { res.status(400).json({ error: 'message is required.' }); return; }
+
+  const brief = safeJsonParse<Brief>(briefRow.data, {} as Brief);
+  const epics = epicRows.map((r) => safeJsonParse<Epic>(r.data, {} as Epic));
+  const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
+
+  let result;
+  try {
+    result = await chatAboutEpics(project.provider as 'anthropic' | 'openai', brief, epics, message, history);
+  } catch (err) {
+    throw llmErrorToHttp(err);
+  }
+
+  // Translate the model's 1-based epicIndex into an actual epic id for
+  // rewriteOne and removeOne. The model only sees a numbered list — it never
+  // sees real UUIDs.
+  if (result.rewriteOne) {
+    const targetEpic = epics[result.rewriteOne.epicIndex - 1];
+    if (targetEpic && typeof targetEpic.id === 'string') {
+      res.json({
+        reply: result.reply,
+        rewriteOne: {
+          epicId: targetEpic.id,
+          epicTitle: targetEpic.title,
+          instruction: result.rewriteOne.instruction,
+        },
+      });
+      return;
+    }
+    res.json({ reply: `${result.reply}\n\n(I couldn't pinpoint which epic to change — could you name it?)` });
+    return;
+  }
+
+  if (result.removeOne) {
+    const targetEpic = epics[result.removeOne.epicIndex - 1];
+    if (targetEpic && typeof targetEpic.id === 'string') {
+      res.json({
+        reply: result.reply,
+        removeOne: { epicId: targetEpic.id, epicTitle: targetEpic.title },
+      });
+      return;
+    }
+    res.json({ reply: `${result.reply}\n\n(I couldn't pinpoint which epic to remove — could you name it?)` });
+    return;
+  }
+
+  res.json(result);
+}));
+
+// POST /projects/:id/epics/add — append a single new epic without touching others
+projectsRouter.post('/:id/epics/add', asyncHandler(async (req, res) => {
+  const project = req.project as unknown as ProjectRow;
+
+  const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  if (!briefRow) { res.status(400).json({ error: 'Generate a brief first.' }); return; }
+
+  const { instruction } = req.body as { instruction?: string };
+  if (typeof instruction !== 'string' || !instruction.trim()) {
+    res.status(400).json({ error: 'instruction is required.' });
+    return;
+  }
+
+  const brief = safeJsonParse<Brief>(briefRow.data, {} as Brief);
+  const existingRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1 ORDER BY created_at ASC', [req.params['id']]);
+  const existing = existingRows.map((r) => safeJsonParse<Epic>(r.data, {} as Epic));
+
+  let epic: Epic;
+  try {
+    epic = await generateOneEpic(brief, existing, project.provider as 'anthropic' | 'openai', instruction.trim());
+  } catch (err) {
+    throw llmErrorToHttp(err);
+  }
+
+  await execute(
+    'INSERT INTO epics (id, project_id, epic_key, version, is_current, data, label) VALUES (?, ?, ?, 1, 1, ?, ?)',
+    [uuid(), req.params['id'], epic.id, JSON.stringify(epic), 'AI Generated (added via chat)'],
+  );
+  await execute('UPDATE projects SET updated_at = NOW() WHERE id = ?', [req.params['id']]);
+
+  res.json({
+    current: epic,
+    versions: [{ version: 1, label: 'AI Generated (added via chat)', challengeText: '', createdAt: new Date().toISOString(), data: epic }],
+  });
 }));
 
 // POST /projects/:id/epics/:epicKey/restore/:version
@@ -816,6 +1230,88 @@ projectsRouter.get('/:id/journeys', async (req, res) => {
   res.json(result);
 });
 
+// POST /projects/:id/journeys/chat — conversational reply about journeys
+projectsRouter.post('/:id/journeys/chat', asyncHandler(async (req, res) => {
+  const project = req.project as unknown as ProjectRow;
+  const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  if (!briefRow) { res.status(400).json({ error: 'Generate a brief first.' }); return; }
+  const epicRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1 ORDER BY created_at ASC', [req.params['id']]);
+  const journeyRows = await query<JourneyRow>('SELECT * FROM journeys WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+
+  const body = req.body as { message?: string; history?: { role: 'user' | 'agent'; text: string }[] };
+  const message = (body.message ?? '').trim();
+  if (!message) { res.status(400).json({ error: 'message is required.' }); return; }
+
+  const brief = safeJsonParse<Brief>(briefRow.data, {} as Brief);
+  const epics = epicRows.map((r) => safeJsonParse<Epic>(r.data, {} as Epic));
+  const journeys = journeyRows.map((r) => safeJsonParse<Journey>(r.data, {} as Journey));
+  const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
+
+  let result;
+  try {
+    result = await chatAboutJourneys(project.provider as 'anthropic' | 'openai', brief, epics, journeys, message, history);
+  } catch (err) {
+    throw llmErrorToHttp(err);
+  }
+
+  if (result.rewriteOne) {
+    const target = journeys[result.rewriteOne.itemIndex - 1];
+    if (target?.id) {
+      res.json({ reply: result.reply, rewriteOne: { itemId: target.id, itemTitle: target.title, instruction: result.rewriteOne.instruction } });
+      return;
+    }
+    res.json({ reply: `${result.reply}\n\n(I couldn't pinpoint which journey to change — could you name it?)` });
+    return;
+  }
+  if (result.removeOne) {
+    const target = journeys[result.removeOne.itemIndex - 1];
+    if (target?.id) {
+      res.json({ reply: result.reply, removeOne: { itemId: target.id, itemTitle: target.title } });
+      return;
+    }
+    res.json({ reply: `${result.reply}\n\n(I couldn't pinpoint which journey to remove — could you name it?)` });
+    return;
+  }
+  res.json(result);
+}));
+
+// POST /projects/:id/journeys/add — append one new journey without disturbing others
+projectsRouter.post('/:id/journeys/add', asyncHandler(async (req, res) => {
+  const project = req.project as unknown as ProjectRow;
+  const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  if (!briefRow) { res.status(400).json({ error: 'Generate a brief first.' }); return; }
+  const epicRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1 ORDER BY created_at ASC', [req.params['id']]);
+  const existingRows = await query<JourneyRow>('SELECT * FROM journeys WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+
+  const { instruction } = req.body as { instruction?: string };
+  if (typeof instruction !== 'string' || !instruction.trim()) {
+    res.status(400).json({ error: 'instruction is required.' });
+    return;
+  }
+
+  const brief = safeJsonParse<Brief>(briefRow.data, {} as Brief);
+  const epics = epicRows.map((r) => safeJsonParse<Epic>(r.data, {} as Epic));
+  const existing = existingRows.map((r) => safeJsonParse<Journey>(r.data, {} as Journey));
+
+  let journey: Journey;
+  try {
+    journey = await generateOneJourney(brief, epics, existing, project.provider as 'anthropic' | 'openai', instruction.trim());
+  } catch (err) {
+    throw llmErrorToHttp(err);
+  }
+
+  await execute(
+    'INSERT INTO journeys (id, project_id, journey_key, version, is_current, data, label) VALUES (?, ?, ?, 1, 1, ?, ?)',
+    [uuid(), req.params['id'], journey.id, JSON.stringify(journey), 'AI Generated (added via chat)'],
+  );
+  await execute('UPDATE projects SET updated_at = NOW() WHERE id = ?', [req.params['id']]);
+
+  res.json({
+    current: journey,
+    versions: [{ version: 1, label: 'AI Generated (added via chat)', challengeText: '', createdAt: new Date().toISOString(), data: journey }],
+  });
+}));
+
 // POST /projects/:id/journeys/generate
 projectsRouter.post('/:id/journeys/generate', asyncHandler(async (req, res) => {
   const project = req.project as unknown as ProjectRow;
@@ -823,35 +1319,63 @@ projectsRouter.post('/:id/journeys/generate', asyncHandler(async (req, res) => {
   const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
   if (!briefRow) { res.status(400).json({ error: 'Generate a brief first.' }); return; }
 
-  const epicRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const epicRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1 ORDER BY created_at ASC', [req.params['id']]);
   if (epicRows.length === 0) { res.status(400).json({ error: 'Generate epics first.' }); return; }
 
   const brief = safeJsonParse<Brief>(briefRow.data, {} as Brief);
   const epics = epicRows.map((r) => safeJsonParse<Epic>(r.data, {} as Epic));
   const { systemPrompt, userTemplate } = await getPromptConfig('journey_generation', req.user!.orgId, promptType(project.project_type));
   const challengeText = (req.body as { challengeText?: string }).challengeText ?? '';
+  const provider = project.provider as 'anthropic' | 'openai';
 
-  let journeys;
-  try {
-    journeys = await generateJourneys(epics, brief, project.provider as 'anthropic' | 'openai', systemPrompt, userTemplate, challengeText);
-  } catch (err) {
-    throw llmErrorToHttp(err);
-  }
-
+  // Deactivate the existing journeys UPFRONT so the polling endpoint returns
+  // an empty list during the LLM call — the user sees journeys appear from a
+  // clean slate rather than seeing old data swap with new data at the end.
   await execute('UPDATE journeys SET is_current = 0 WHERE project_id = ?', [req.params['id']]);
 
-  for (const journey of journeys) {
-    const journeyKey = journey.id;
-    await execute(
-      'INSERT INTO journeys (id, project_id, journey_key, version, is_current, data, label) VALUES (?, ?, ?, 1, 1, ?, ?)',
-      [uuid(), req.params['id'], journeyKey, JSON.stringify(journey), 'AI Generated v1'],
+  // Stream journeys epic-by-epic. Generate in batches of CONCURRENCY epics in
+  // parallel, then INSERT each batch's journeys into the DB before moving on.
+  // The frontend polls GET /journeys every 3s, so journey cards appear in the
+  // sidebar as each batch lands.
+  const CONCURRENCY = 3;
+  const failures: string[] = [];
+
+  for (let i = 0; i < epics.length; i += CONCURRENCY) {
+    const batch = epics.slice(i, i + CONCURRENCY);
+    const results = await Promise.allSettled(
+      batch.map((epic) => generateJourneysForEpic(epic, brief, provider, systemPrompt, userTemplate, challengeText)),
     );
+
+    // Insert this batch's journeys immediately — that's what makes them
+    // visible to the next poll. Without this, all inserts happen at the end.
+    for (let j = 0; j < results.length; j++) {
+      const r = results[j]!;
+      if (r.status === 'fulfilled') {
+        for (const journey of r.value) {
+          await execute(
+            'INSERT INTO journeys (id, project_id, journey_key, version, is_current, data, label) VALUES (?, ?, ?, 1, 1, ?, ?)',
+            [uuid(), req.params['id'], journey.id, JSON.stringify(journey), 'AI Generated v1'],
+          );
+        }
+      } else {
+        const epicTitle = batch[j]!.title;
+        const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        console.warn(`[journeys/generate] epic "${epicTitle}" failed:`, reason);
+        failures.push(`${epicTitle}: ${reason}`);
+      }
+    }
+  }
+
+  // If every batch failed, surface that as an HTTP error instead of silently
+  // returning an empty list.
+  const savedRows = await query<JourneyRow>('SELECT * FROM journeys WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  if (savedRows.length === 0 && failures.length > 0) {
+    throw llmErrorToHttp(new Error(`Journey generation failed for every epic: ${failures.slice(0, 3).join('; ')}${failures.length > 3 ? '…' : ''}`));
   }
 
   await execute('UPDATE projects SET updated_at = NOW() WHERE id = ?', [req.params['id']]);
 
-  const saved = await query<JourneyRow>('SELECT * FROM journeys WHERE project_id = ? AND is_current = 1', [req.params['id']]);
-  res.json(saved.map((r) => ({
+  res.json(savedRows.map((r) => ({
     current: typeof r.data === 'string' ? JSON.parse(r.data) : r.data,
     versions: [{ version: 1, label: 'AI Generated v1', challengeText: '', createdAt: r.created_at, data: typeof r.data === 'string' ? JSON.parse(r.data) : r.data }],
   })));
@@ -891,9 +1415,40 @@ projectsRouter.post('/:id/journeys/:journeyKey/rewrite', asyncHandler(async (req
   const instruction = (req.body as { instruction?: string }).instruction ?? '';
   const { systemPrompt } = await getPromptConfig('journey_generation', req.user!.orgId, promptType(project.project_type));
 
+  // Page context — parent epic (to pin scope) + sibling journeys for that epic.
+  // The brief is also included so the rewrite can't contradict project scope.
+  const parentEpicId = typeof currentData['epicId'] === 'string' ? currentData['epicId'] as string : null;
+  const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const briefData = briefRow ? safeJsonParse<Brief>(briefRow.data, {} as Brief) : null;
+  const epicRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const parentEpicData = parentEpicId
+    ? epicRows.map((r) => safeJsonParse<Record<string, unknown>>(r.data, {})).find((d) => d['id'] === parentEpicId)
+    : null;
+  const siblingRows = await query<JourneyRow>(
+    'SELECT * FROM journeys WHERE project_id = ? AND is_current = 1 AND journey_key <> ?',
+    [req.params['id'], req.params['journeyKey']],
+  );
+  const siblings = siblingRows
+    .map((r) => safeJsonParse<Record<string, unknown>>(r.data, {}))
+    .filter((d) => !parentEpicId || d['epicId'] === parentEpicId)
+    .map((d) => ({
+      title: typeof d['title'] === 'string' ? d['title'] : undefined,
+      summary: typeof d['happyPath'] === 'string' ? d['happyPath'].slice(0, 140) : undefined,
+    }));
+  const context: RewriteContext = {
+    brief: briefData ? { summary: briefData.summary, scope: briefData.inScope, outOfScope: briefData.outOfScope } : null,
+    parent: parentEpicData
+      ? {
+          title: typeof parentEpicData['title'] === 'string' ? parentEpicData['title'] : undefined,
+          description: typeof parentEpicData['description'] === 'string' ? parentEpicData['description'] : undefined,
+        }
+      : null,
+    siblings,
+  };
+
   let rewritten;
   try {
-    rewritten = await rewriteItem('journey', currentData, instruction, project.provider as 'anthropic' | 'openai', systemPrompt);
+    rewritten = await rewriteItem('journey', currentData, instruction, project.provider as 'anthropic' | 'openai', systemPrompt, context);
   } catch (err) {
     throw llmErrorToHttp(err);
   }
@@ -951,6 +1506,93 @@ projectsRouter.get('/:id/tasks', async (req, res) => {
   res.json(result);
 });
 
+// POST /projects/:id/tasks/chat — conversational reply about tasks
+projectsRouter.post('/:id/tasks/chat', asyncHandler(async (req, res) => {
+  const project = req.project as unknown as ProjectRow;
+  const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  if (!briefRow) { res.status(400).json({ error: 'Generate a brief first.' }); return; }
+  const epicRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1 ORDER BY created_at ASC', [req.params['id']]);
+  const journeyRows = await query<JourneyRow>('SELECT * FROM journeys WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const taskRows = await query<TaskRow>('SELECT * FROM tasks WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+
+  const body = req.body as { message?: string; history?: { role: 'user' | 'agent'; text: string }[] };
+  const message = (body.message ?? '').trim();
+  if (!message) { res.status(400).json({ error: 'message is required.' }); return; }
+
+  const brief = safeJsonParse<Brief>(briefRow.data, {} as Brief);
+  const epics = epicRows.map((r) => safeJsonParse<Epic>(r.data, {} as Epic));
+  const journeys = journeyRows.map((r) => safeJsonParse<Journey>(r.data, {} as Journey));
+  const tasks = taskRows.map((r) => safeJsonParse<Record<string, unknown>>(r.data, {} as Record<string, unknown>));
+  const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
+
+  let result;
+  try {
+    result = await chatAboutTasks(project.provider as 'anthropic' | 'openai', brief, epics, journeys, tasks, message, history);
+  } catch (err) {
+    throw llmErrorToHttp(err);
+  }
+
+  if (result.rewriteOne) {
+    const target = tasks[result.rewriteOne.itemIndex - 1];
+    if (target && typeof target['id'] === 'string') {
+      res.json({ reply: result.reply, rewriteOne: { itemId: target['id'], itemTitle: target['title'] ?? '', instruction: result.rewriteOne.instruction } });
+      return;
+    }
+    res.json({ reply: `${result.reply}\n\n(I couldn't pinpoint which task to change — could you name it?)` });
+    return;
+  }
+  if (result.removeOne) {
+    const target = tasks[result.removeOne.itemIndex - 1];
+    if (target && typeof target['id'] === 'string') {
+      res.json({ reply: result.reply, removeOne: { itemId: target['id'], itemTitle: target['title'] ?? '' } });
+      return;
+    }
+    res.json({ reply: `${result.reply}\n\n(I couldn't pinpoint which task to remove — could you name it?)` });
+    return;
+  }
+  res.json(result);
+}));
+
+// POST /projects/:id/tasks/add — append one new task without disturbing others
+projectsRouter.post('/:id/tasks/add', asyncHandler(async (req, res) => {
+  const project = req.project as unknown as ProjectRow;
+  const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  if (!briefRow) { res.status(400).json({ error: 'Generate a brief first.' }); return; }
+  const epicRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1 ORDER BY created_at ASC', [req.params['id']]);
+  const journeyRows = await query<JourneyRow>('SELECT * FROM journeys WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const existingRows = await query<TaskRow>('SELECT * FROM tasks WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+
+  const { instruction } = req.body as { instruction?: string };
+  if (typeof instruction !== 'string' || !instruction.trim()) {
+    res.status(400).json({ error: 'instruction is required.' });
+    return;
+  }
+
+  const brief = safeJsonParse<Brief>(briefRow.data, {} as Brief);
+  const epics = epicRows.map((r) => safeJsonParse<Epic>(r.data, {} as Epic));
+  const journeys = journeyRows.map((r) => safeJsonParse<Journey>(r.data, {} as Journey));
+  const existing = existingRows.map((r) => safeJsonParse<Record<string, unknown>>(r.data, {} as Record<string, unknown>));
+
+  let task: Record<string, unknown>;
+  try {
+    task = await generateOneTask(brief, epics, journeys, existing, project.provider as 'anthropic' | 'openai', instruction.trim());
+  } catch (err) {
+    throw llmErrorToHttp(err);
+  }
+
+  const taskKey = String(task['id'] ?? uuid());
+  await execute(
+    'INSERT INTO tasks (id, project_id, task_key, version, is_current, data, label) VALUES (?, ?, ?, 1, 1, ?, ?)',
+    [uuid(), req.params['id'], taskKey, JSON.stringify(task), 'AI Generated (added via chat)'],
+  );
+  await execute('UPDATE projects SET updated_at = NOW() WHERE id = ?', [req.params['id']]);
+
+  res.json({
+    current: task,
+    versions: [{ version: 1, label: 'AI Generated (added via chat)', challengeText: '', createdAt: new Date().toISOString(), data: task }],
+  });
+}));
+
 // POST /projects/:id/tasks/generate
 projectsRouter.post('/:id/tasks/generate', asyncHandler(async (req, res) => {
   const project = req.project as unknown as ProjectRow;
@@ -958,7 +1600,7 @@ projectsRouter.post('/:id/tasks/generate', asyncHandler(async (req, res) => {
   const journeyRows = await query<JourneyRow>('SELECT * FROM journeys WHERE project_id = ? AND is_current = 1', [req.params['id']]);
   if (journeyRows.length === 0) { res.status(400).json({ error: 'Generate journeys first.' }); return; }
 
-  const epicRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const epicRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1 ORDER BY created_at ASC', [req.params['id']]);
   const epicMap = new Map<string, Epic>(
     epicRows.map((r) => {
       const d = safeJsonParse<Epic>(r.data, {} as Epic);
@@ -1096,9 +1738,53 @@ projectsRouter.post('/:id/tasks/:taskKey/rewrite', asyncHandler(async (req, res)
   const instruction = (req.body as { instruction?: string }).instruction ?? '';
   const { systemPrompt } = await getPromptConfig('task_decomposition', req.user!.orgId, promptType(project.project_type));
 
+  // Page context — parent journey (happy path + steps) + grandparent epic
+  // (title + description) + sibling tasks for the same journey. Keeps the
+  // rewrite pinned to the Tasks page and prevents the LLM from drifting up
+  // into journey or epic scope.
+  const parentJourneyId = typeof currentData['journeyId'] === 'string' ? currentData['journeyId'] as string : null;
+  const parentEpicId = typeof currentData['epicId'] === 'string' ? currentData['epicId'] as string : null;
+  const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const briefData = briefRow ? safeJsonParse<Brief>(briefRow.data, {} as Brief) : null;
+  const journeyRows = await query<JourneyRow>('SELECT * FROM journeys WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const epicRows = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1', [req.params['id']]);
+  const parentJourneyData = parentJourneyId
+    ? journeyRows.map((r) => safeJsonParse<Record<string, unknown>>(r.data, {})).find((d) => d['id'] === parentJourneyId)
+    : null;
+  const grandparentEpicData = parentEpicId
+    ? epicRows.map((r) => safeJsonParse<Record<string, unknown>>(r.data, {})).find((d) => d['id'] === parentEpicId)
+    : null;
+  const siblingRows = await query<TaskRow>(
+    'SELECT * FROM tasks WHERE project_id = ? AND is_current = 1 AND task_key <> ?',
+    [req.params['id'], req.params['taskKey']],
+  );
+  const siblings = siblingRows
+    .map((r) => safeJsonParse<Record<string, unknown>>(r.data, {}))
+    .filter((d) => !parentJourneyId || d['journeyId'] === parentJourneyId)
+    .map((d) => ({
+      title: typeof d['title'] === 'string' ? d['title'] : undefined,
+      summary: typeof d['estimateHours'] === 'number' ? `${d['estimateHours']}h estimate` : undefined,
+    }));
+  const context: RewriteContext = {
+    brief: briefData ? { summary: briefData.summary, scope: briefData.inScope, outOfScope: briefData.outOfScope } : null,
+    grandparent: grandparentEpicData
+      ? {
+          title: typeof grandparentEpicData['title'] === 'string' ? grandparentEpicData['title'] : undefined,
+          description: typeof grandparentEpicData['description'] === 'string' ? grandparentEpicData['description'] : undefined,
+        }
+      : null,
+    parent: parentJourneyData
+      ? {
+          title: typeof parentJourneyData['title'] === 'string' ? parentJourneyData['title'] : undefined,
+          description: typeof parentJourneyData['happyPath'] === 'string' ? parentJourneyData['happyPath'] : undefined,
+        }
+      : null,
+    siblings,
+  };
+
   let rewritten;
   try {
-    rewritten = await rewriteItem('task', currentData, instruction, project.provider as 'anthropic' | 'openai', systemPrompt);
+    rewritten = await rewriteItem('task', currentData, instruction, project.provider as 'anthropic' | 'openai', systemPrompt, context);
   } catch (err) {
     throw llmErrorToHttp(err);
   }

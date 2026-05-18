@@ -167,6 +167,47 @@ CREATE TABLE IF NOT EXISTS sync_log (
   INDEX idx_created (created_at)
 );
 
+-- ─── Document attachments for project intake ─────────────────────────────────
+-- Adds attachments_text (concatenated extracted text from all uploaded docs;
+-- fed alongside raw_input into generateBrief / previewProject) and the
+-- project_attachments table tracking per-file metadata + extraction status.
+
+SET @col_exists = (
+  SELECT COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'projects' AND COLUMN_NAME = 'attachments_text'
+);
+SET @sql = IF(@col_exists = 0,
+  'ALTER TABLE projects ADD COLUMN attachments_text LONGTEXT NULL AFTER raw_input',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+CREATE TABLE IF NOT EXISTS project_attachments (
+  id VARCHAR(36) PRIMARY KEY,
+  project_id VARCHAR(36) NOT NULL,
+  filename VARCHAR(255) NOT NULL,
+  mime_type VARCHAR(120) NOT NULL,
+  size_bytes INT NOT NULL,
+  status ENUM('pending','ok','failed') NOT NULL DEFAULT 'pending',
+  extracted_chars INT NOT NULL DEFAULT 0,
+  extracted_text LONGTEXT NULL,
+  error_message VARCHAR(500) DEFAULT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_project (project_id)
+);
+
+-- If project_attachments existed from an earlier dev cycle without
+-- extracted_text, add the column idempotently.
+SET @col_exists = (
+  SELECT COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'project_attachments' AND COLUMN_NAME = 'extracted_text'
+);
+SET @sql = IF(@col_exists = 0,
+  'ALTER TABLE project_attachments ADD COLUMN extracted_text LONGTEXT NULL AFTER extracted_chars',
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
 -- ─── Multi-channel support ────────────────────────────────────────────────────
 -- Converts communication_channel from ENUM to JSON array VARCHAR.
 -- Wraps existing single values into arrays e.g. 'upwork' → '["upwork"]'

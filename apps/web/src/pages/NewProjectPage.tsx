@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback } from 'react';
+import { useRef, useState, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -14,9 +14,11 @@ import {
   Paperclip,
 } from 'lucide-react';
 import { useProjectStore } from '../store/useProjectStore';
+import { useAvailableProviders } from '../hooks/useAvailableProviders';
+import { api } from '../lib/api';
 import { Button } from '../components/ui/button';
 import type { ProjectDefinition, AttachedFile } from '../data/mockData';
-import type { CommunicationChannel } from '../constants/enums';
+import type { CommunicationChannel, AIProvider } from '../constants/enums';
 import {
   PROJECT_TYPE_VALUES_SELECTABLE,
   PROJECT_TYPE_LABELS,
@@ -75,26 +77,92 @@ function FieldError({ message }: { message: string | null | undefined }) {
 
 const STEP_LABELS = ['Project Info', 'Communication', 'Raw Input'];
 
-interface LocalAttachedFile extends AttachedFile {}
+// Draft is persisted to localStorage so a hard refresh / accidental close
+// doesn't wipe a half-typed form. Cleared after a successful create or on Cancel.
+const DRAFT_KEY = 'wbs_new_project_draft';
+
+interface ProjectDraft {
+  step: number;
+  name: string;
+  client: string;
+  projectType: ProjectDefinition['projectType'];
+  estimatedBudget: string;
+  startDate: string;
+  communicationChannels: CommunicationChannel[];
+  channelLinks: Partial<Record<CommunicationChannel, string>>;
+  contactPerson: string;
+  provider: AIProvider;
+  rawInput: string;
+}
+
+function loadDraft(): Partial<ProjectDraft> {
+  try {
+    const raw = localStorage.getItem(DRAFT_KEY);
+    return raw ? JSON.parse(raw) as Partial<ProjectDraft> : {};
+  } catch { return {}; }
+}
+
+function saveDraft(draft: ProjectDraft): void {
+  try { localStorage.setItem(DRAFT_KEY, JSON.stringify(draft)); } catch { /* quota — ignore */ }
+}
+
+function clearDraft(): void {
+  try { localStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ }
+}
+
+interface LocalAttachedFile extends AttachedFile {
+  /** Original File handle — kept so we can POST the bytes after createProject.
+      Lost on reload (intentional — uploads don't persist in localStorage). */
+  file?: File;
+  /** Per-file upload lifecycle so the UI can show status pills. */
+  uploadStatus?: 'idle' | 'uploading' | 'ok' | 'failed';
+  /** Backend extraction result — chars extracted; null when failed. */
+  extractedChars?: number | null;
+  /** Human-readable failure reason when uploadStatus === 'failed'. */
+  uploadError?: string;
+}
 
 export function NewProjectPage() {
   const navigate = useNavigate();
   const createProject = useProjectStore((s) => s.createProject);
   const setDefinitionField = useProjectStore((s) => s.setDefinitionField);
 
-  const [step, setStep] = useState(0);
-  const [name, setName] = useState('');
-  const [client, setClient] = useState('');
-  const [projectType, setProjectType] = useState<ProjectDefinition['projectType']>('web_app');
-  const [estimatedBudget, setEstimatedBudget] = useState('');
-  const [startDate, setStartDate] = useState('');
-  const [communicationChannels, setCommunicationChannels] = useState<CommunicationChannel[]>(['upwork']);
-  const [channelLinks, setChannelLinks] = useState<Partial<Record<CommunicationChannel, string>>>({});
-  const [contactPerson, setContactPerson] = useState('');
-  const [provider, setProvider] = useState<'anthropic' | 'openai'>('anthropic');
-  const [rawInput, setRawInput] = useState('');
+  // Restore draft from localStorage once at mount.
+  const initial = loadDraft();
+
+  const [step, setStep] = useState<number>(initial.step ?? 0);
+  const [name, setName] = useState<string>(initial.name ?? '');
+  const [client, setClient] = useState<string>(initial.client ?? '');
+  const [projectType, setProjectType] = useState<ProjectDefinition['projectType']>(initial.projectType ?? 'web_app');
+  const [estimatedBudget, setEstimatedBudget] = useState<string>(initial.estimatedBudget ?? '');
+  const [startDate, setStartDate] = useState<string>(initial.startDate ?? '');
+  const [communicationChannels, setCommunicationChannels] = useState<CommunicationChannel[]>(initial.communicationChannels ?? ['upwork']);
+  const [channelLinks, setChannelLinks] = useState<Partial<Record<CommunicationChannel, string>>>(initial.channelLinks ?? {});
+  const [contactPerson, setContactPerson] = useState<string>(initial.contactPerson ?? '');
+  const [provider, setProvider] = useState<AIProvider>(initial.provider ?? 'anthropic');
+  const { providers: availableProviders, loading: loadingProviders } = useAvailableProviders();
+
+  // Pin provider to a configured one — if the user's stored default isn't
+  // available, fall back to whichever is. With zero providers configured the
+  // toggle is hidden and the value is irrelevant until they set a key.
+  useEffect(() => {
+    if (loadingProviders || availableProviders.length === 0) return;
+    if (!availableProviders.includes(provider)) {
+      setProvider(availableProviders[0]!);
+    }
+  }, [availableProviders, loadingProviders, provider]);
+  const [rawInput, setRawInput] = useState<string>(initial.rawInput ?? '');
   const [attachedFiles, setAttachedFiles] = useState<LocalAttachedFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+
+  // Save the draft to localStorage whenever any field changes. Doesn't include
+  // attachedFiles because File/Blob objects don't serialise cleanly.
+  useEffect(() => {
+    saveDraft({
+      step, name, client, projectType, estimatedBudget, startDate,
+      communicationChannels, channelLinks, contactPerson, provider, rawInput,
+    });
+  }, [step, name, client, projectType, estimatedBudget, startDate, communicationChannels, channelLinks, contactPerson, provider, rawInput]);
   // Track which fields the user has interacted with so validation messages
   // appear on blur (or after a failed Continue click), not while they type.
   const [touched, setTouched] = useState<Record<string, boolean>>({});
@@ -104,13 +172,21 @@ export function NewProjectPage() {
 
   const handleFiles = useCallback((files: FileList | null) => {
     if (!files) return;
-    const valid = Array.from(files).filter((f) => ACCEPTED_TYPES.includes(f.type) || f.name.endsWith('.md'));
+    // Reject files > 10 MB before they hit the wire — multer would also
+    // reject, but failing fast keeps the per-file UI honest.
+    const MAX_BYTES = 10 * 1024 * 1024;
+    const valid = Array.from(files).filter((f) => {
+      const typeOk = ACCEPTED_TYPES.includes(f.type) || f.name.endsWith('.md');
+      return typeOk && f.size <= MAX_BYTES;
+    });
     const next: LocalAttachedFile[] = valid.map((f) => ({
       id: `${f.name}-${f.size}-${Date.now()}-${Math.random()}`,
       name: f.name,
       size: f.size,
       type: f.type,
       previewUrl: f.type.startsWith('image/') ? URL.createObjectURL(f) : null,
+      file: f,
+      uploadStatus: 'idle',
     }));
     const existing = new Set(attachedFiles.map((a) => `${a.name}-${a.size}`));
     setAttachedFiles((prev) => [...prev, ...next.filter((f) => !existing.has(`${f.name}-${f.size}`))]);
@@ -157,6 +233,54 @@ export function NewProjectPage() {
         rawInput,
         provider,
       });
+
+      // Upload + server-side extraction for any attached files. We do this
+      // BEFORE navigating to the Brief page so the brief generator already
+      // sees the extracted text on first load. Failures are surfaced inline
+      // but do NOT block project creation — raw_input alone is still valid.
+      const filesToUpload = attachedFiles.filter((f) => f.file);
+      if (filesToUpload.length > 0) {
+        setAttachedFiles((prev) =>
+          prev.map((f) => (filesToUpload.some((u) => u.id === f.id) ? { ...f, uploadStatus: 'uploading' } : f)),
+        );
+        try {
+          const fd = new FormData();
+          for (const f of filesToUpload) {
+            if (f.file) fd.append('files', f.file, f.name);
+          }
+          const result = await api.upload<{ attachments: Array<{ filename: string; status: 'ok' | 'failed'; extracted_chars: number; error_message: string | null }> }>(
+            `/projects/${id}/attachments`,
+            fd,
+          );
+          // Map each upload result back to its local file by filename. Names
+          // are unique within a single create flow (handleFiles dedupes).
+          const byName = new Map(result.attachments.map((a) => [a.filename, a]));
+          setAttachedFiles((prev) =>
+            prev.map((f) => {
+              const r = byName.get(f.name);
+              if (!r) return f;
+              return {
+                ...f,
+                uploadStatus: r.status === 'ok' ? 'ok' : 'failed',
+                extractedChars: r.status === 'ok' ? r.extracted_chars : null,
+                uploadError: r.error_message ?? undefined,
+              };
+            }),
+          );
+        } catch (err) {
+          // Network / 4xx / 5xx — mark every uploading file as failed so the
+          // user sees what happened. Don't throw — project was already created.
+          const msg = err instanceof Error ? err.message : 'Upload failed';
+          setAttachedFiles((prev) =>
+            prev.map((f) => (f.uploadStatus === 'uploading' ? { ...f, uploadStatus: 'failed', uploadError: msg } : f)),
+          );
+          setSubmitError(`Project created, but some attachments could not be uploaded: ${msg}.`);
+          setIsCreating(false);
+          return;
+        }
+      }
+
+      clearDraft();
       navigate(`/projects/${id}/brief`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to create project.';
@@ -217,12 +341,22 @@ export function NewProjectPage() {
         : contactPerson.trim().length < 2
         ? 'Use at least 2 characters.'
         : null,
-    rawInput:
-      rawInput.trim().length === 0
-        ? 'Raw client input is required so we can extract a brief.'
-        : rawInput.trim().length < 30
-        ? 'Add more detail (at least 30 characters) so the AI has enough to work with.'
-        : null,
+    // Either-or rule: the user must give the AI *something* to extract a brief
+    // from. Raw text is the primary path, but a single attachment (PDF, DOCX,
+    // image, etc.) is equally valid — the brief extractor reads both. If the
+    // user pastes raw text we still enforce the 30-char minimum so we don't
+    // feed the LLM something like "make me an app".
+    rawInput: (() => {
+      const hasRaw = rawInput.trim().length > 0;
+      const hasAttachment = attachedFiles.length > 0;
+      if (!hasRaw && !hasAttachment) {
+        return 'Provide raw client input OR upload at least one document so we can extract a brief.';
+      }
+      if (hasRaw && rawInput.trim().length < 30) {
+        return 'Add more detail (at least 30 characters) — or remove the text and rely on the uploaded document instead.';
+      }
+      return null;
+    })(),
   } as const;
 
   // No per-channel validation — references are freeform (URL, ID, email,
@@ -465,20 +599,43 @@ export function NewProjectPage() {
                 <label className="block text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: 'var(--text-secondary)' }}>
                   AI Provider
                 </label>
-                <div className="flex items-center gap-1 rounded-lg p-1 w-fit" style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border)' }}>
-                  {(['anthropic', 'openai'] as const).map((p) => (
-                    <button
-                      key={p}
-                      onClick={() => setProvider(p)}
-                      className="px-4 py-2 rounded-md text-xs font-medium transition-all duration-150 cursor-pointer"
-                      style={provider === p ? {
-                        background: '#7c3aed', color: '#fff',
-                      } : { color: 'var(--text-muted)' }}
-                    >
-                      {p === 'anthropic' ? 'Anthropic' : 'OpenAI'}
-                    </button>
-                  ))}
-                </div>
+                {availableProviders.length >= 2 ? (
+                  <div className="flex items-center gap-1 rounded-lg p-1 w-fit" style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border)' }}>
+                    {availableProviders.map((p) => (
+                      <button
+                        key={p}
+                        onClick={() => setProvider(p)}
+                        className="px-4 py-2 rounded-md text-xs font-medium transition-all duration-150 cursor-pointer"
+                        style={provider === p ? {
+                          background: '#7c3aed', color: '#fff',
+                        } : { color: 'var(--text-muted)' }}
+                      >
+                        {p === 'anthropic' ? 'Anthropic' : 'OpenAI'}
+                      </button>
+                    ))}
+                  </div>
+                ) : availableProviders.length === 1 ? (
+                  <div
+                    className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-xs"
+                    style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
+                  >
+                    <span
+                      className="w-1.5 h-1.5 rounded-full"
+                      style={{ background: availableProviders[0] === 'anthropic' ? '#f97316' : '#10b981' }}
+                    />
+                    <span className="font-medium">
+                      {availableProviders[0] === 'anthropic' ? 'Anthropic' : 'OpenAI'}
+                    </span>
+                    <span style={{ color: 'var(--text-dim)' }}>· only configured provider</span>
+                  </div>
+                ) : !loadingProviders ? (
+                  <div
+                    className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-xs"
+                    style={{ background: 'var(--warning-bg)', border: '1px solid var(--warning-border)', color: 'var(--warning-text)' }}
+                  >
+                    No AI provider configured — set an API key in Admin → Integrations.
+                  </div>
+                ) : null}
               </div>
             </motion.div>
           )}
@@ -493,21 +650,25 @@ export function NewProjectPage() {
               className="space-y-5"
             >
               <div>
-                <label className="block text-xs font-semibold mb-2 uppercase tracking-wider" style={{ color: 'var(--text-secondary)' }}>
-                  Raw Client Input <span className="text-red-400">*</span>
+                <label className="flex items-baseline justify-between mb-2">
+                  <span className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--text-secondary)' }}>
+                    Raw Client Input
+                  </span>
+                  <span className="text-[10px] normal-case font-normal" style={{ color: 'var(--text-dim)' }}>
+                    {attachedFiles.length > 0 ? 'optional — attachments will be used' : 'required if no attachment'}
+                  </span>
                 </label>
                 <textarea
                   className="w-full min-h-[200px] px-4 py-3 rounded-xl text-sm placeholder-[var(--text-dim)] resize-none focus:outline-none focus:ring-2 focus:ring-violet-500 focus:border-transparent font-mono leading-relaxed transition-colors"
                   style={{ background: 'var(--bg-input)', border: `1px solid ${touched['rawInput'] && errors.rawInput ? 'rgb(248,113,113)' : 'var(--border)'}` }}
-                  placeholder="Paste Upwork chat, transcript, or BD notes here…"
+                  placeholder={attachedFiles.length > 0
+                    ? 'Optional — paste extra context, or leave empty and let the AI read your attachment…'
+                    : 'Paste Upwork chat, transcript, or BD notes here — OR drop a scope doc below.'}
                   value={rawInput}
                   onChange={(e) => setRawInput(e.target.value)}
                   onBlur={() => markTouched('rawInput')}
                 />
                 {touched['rawInput'] && <FieldError message={errors.rawInput} />}
-                <p className="text-[11px] mt-1.5" style={{ color: 'var(--text-dim)' }}>
-                  PII is stripped before extraction. Raw input never reaches the LLM directly.
-                </p>
               </div>
 
               <div>
@@ -586,8 +747,32 @@ export function NewProjectPage() {
                                 )}
                                 <div className="min-w-0">
                                   <p className="text-xs truncate max-w-[140px]" style={{ color: 'var(--text-primary)' }}>{file.name}</p>
-                                  <p className="text-[10px]" style={{ color: 'var(--text-muted)' }}>{formatBytes(file.size)}</p>
+                                  <p className="text-[10px]" style={{ color: 'var(--text-muted)' }}>
+                                    {formatBytes(file.size)}
+                                    {file.uploadStatus === 'ok' && typeof file.extractedChars === 'number' && (
+                                      <span className="ml-1" style={{ color: 'var(--success-text)' }}>· {file.extractedChars.toLocaleString()} chars</span>
+                                    )}
+                                  </p>
                                 </div>
+                                {file.uploadStatus === 'uploading' && (
+                                  <span className="text-[10px] font-medium px-1.5 py-0.5 rounded" style={{ background: 'rgba(124,58,237,0.15)', color: 'var(--accent-text)', border: '1px solid rgba(124,58,237,0.3)' }}>
+                                    extracting…
+                                  </span>
+                                )}
+                                {file.uploadStatus === 'ok' && (
+                                  <span className="text-[10px] font-medium px-1.5 py-0.5 rounded" style={{ background: 'var(--success-bg)', color: 'var(--success-text)', border: '1px solid var(--success-border)' }}>
+                                    extracted
+                                  </span>
+                                )}
+                                {file.uploadStatus === 'failed' && (
+                                  <span
+                                    className="text-[10px] font-medium px-1.5 py-0.5 rounded"
+                                    style={{ background: 'var(--error-bg)', color: 'var(--error-text)', border: '1px solid var(--error-border)' }}
+                                    title={file.uploadError}
+                                  >
+                                    failed
+                                  </span>
+                                )}
                                 <button
                                   onClick={(e) => { e.stopPropagation(); removeFile(file.id); }}
                                   className="ml-1 transition-colors opacity-0 group-hover:opacity-100 hover:text-violet-300"
@@ -649,7 +834,7 @@ export function NewProjectPage() {
               Back
             </Button>
           ) : (
-            <Button variant="ghost" onClick={() => navigate('/projects')} className="gap-1.5">
+            <Button variant="ghost" onClick={() => { clearDraft(); navigate('/projects'); }} className="gap-1.5">
               <ArrowLeft size={14} />
               Cancel
             </Button>

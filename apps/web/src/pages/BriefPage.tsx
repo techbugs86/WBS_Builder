@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { api } from '../lib/api';
 import { useNavigate, useParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -14,11 +15,14 @@ import {
   RotateCcw,
   Loader,
   Sparkles,
+  Lightbulb,
 } from 'lucide-react';
 import { useProjectStore } from '../store/useProjectStore';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { ChallengeBar } from '../components/ChallengeBar';
+import { ChatSidebarColumn, ShowChatButton } from '../components/ChatSidebarColumn';
+import { useChatSidebar } from '../hooks/useChatSidebar';
 import { CascadeRegenDialog } from '../components/CascadeRegenDialog';
 import { VersionDropdown } from '../components/VersionDropdown';
 import type { OpenQuestion } from '../data/mockData';
@@ -57,15 +61,42 @@ function QuestionCard({ q }: { q: OpenQuestion }) {
         transition={{ duration: 0.2 }}
         className="overflow-hidden"
       >
-        <div className="flex items-center gap-3 rounded-xl px-4 py-2.5 opacity-40" style={{ background: 'linear-gradient(135deg, var(--bg-card), var(--bg-card-alt))', border: '1px solid var(--border)' }}>
-          <X size={12} className="shrink-0" style={{ color: 'var(--text-dim)' }} />
-          <p className="text-xs flex-1 line-through truncate" style={{ color: 'var(--text-dim)' }}>{q.text}</p>
-          <button
-            onClick={handleReopen}
-            className="shrink-0 transition-colors text-[10px] flex items-center gap-1 hover:text-[var(--accent-text)]"
+        <div
+          className="flex items-center gap-3 rounded-xl px-4 py-2.5"
+          style={{
+            background: 'linear-gradient(135deg, var(--bg-card), var(--bg-card-alt))',
+            border: '1px solid var(--border)',
+          }}
+        >
+          <X size={12} className="shrink-0 opacity-50" style={{ color: 'var(--text-dim)' }} />
+          <p
+            className="text-xs flex-1 line-through truncate opacity-60"
             style={{ color: 'var(--text-dim)' }}
           >
-            <RotateCcw size={10} />
+            {q.text}
+          </p>
+          <button
+            onClick={handleReopen}
+            className="shrink-0 flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition-all duration-150"
+            style={{
+              background: 'rgba(124,58,237,0.18)',
+              border: '1px solid rgba(124,58,237,0.45)',
+              color: 'var(--accent-text)',
+              boxShadow: '0 1px 4px -1px rgba(124,58,237,0.3)',
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = 'rgba(124,58,237,0.3)';
+              e.currentTarget.style.borderColor = 'rgba(167,139,250,0.7)';
+              e.currentTarget.style.color = '#fff';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'rgba(124,58,237,0.18)';
+              e.currentTarget.style.borderColor = 'rgba(124,58,237,0.45)';
+              e.currentTarget.style.color = 'var(--accent-text)';
+            }}
+            title="Bring this question back into the open list"
+          >
+            <RotateCcw size={11} />
             Reopen
           </button>
         </div>
@@ -231,6 +262,63 @@ function QuestionCard({ q }: { q: OpenQuestion }) {
   );
 }
 
+/**
+ * Animated progress card shown while a brief is being generated. Brief gen is
+ * a single LLM call (~10-25s) with no per-section streaming on the backend,
+ * so we drive the bar with a simulated 0% → 95% climb and rotate phase labels
+ * for context. Mirrors the EpicGenerationProgress / TasksPage progress UX.
+ */
+function BriefGenerationProgress() {
+  const [percent, setPercent] = useState(5);
+  useEffect(() => {
+    const tick = setInterval(() => {
+      setPercent((p) => (p >= 95 ? 95 : p + Math.random() * 5));
+    }, 800);
+    return () => clearInterval(tick);
+  }, []);
+  const phase = percent < 30 ? 'Reading the raw client input' : percent < 70 ? 'Extracting summary, scope, and assumptions' : 'Finalising the brief';
+  return (
+    <div className="max-w-2xl mx-auto mt-10 mb-6">
+      <div
+        className="rounded-xl p-5 space-y-3"
+        style={{ background: 'rgba(124,58,237,0.07)', border: '1px solid rgba(124,58,237,0.25)' }}
+      >
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <Loader size={14} className="animate-spin shrink-0" style={{ color: 'var(--accent-text)' }} />
+            <div className="min-w-0">
+              <p className="text-sm font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+                {phase}…
+              </p>
+              <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                The AI is reading your raw input and structuring it into a brief. This usually takes 10-25 seconds.
+              </p>
+            </div>
+          </div>
+          <span
+            className="text-base font-mono font-bold shrink-0 tabular-nums"
+            style={{ color: 'var(--accent-text)' }}
+          >
+            {Math.round(percent)}%
+          </span>
+        </div>
+        <div
+          className="h-2 rounded-full overflow-hidden"
+          style={{ background: 'rgba(124,58,237,0.15)' }}
+        >
+          <motion.div
+            className="h-full"
+            style={{ background: 'linear-gradient(90deg, #7c3aed, #a78bfa)' }}
+            initial={false}
+            animate={{ width: `${percent}%` }}
+            transition={{ duration: 0.6, ease: 'easeOut' }}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function BriefPage() {
   const { id: projectId } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -239,6 +327,14 @@ export function BriefPage() {
   const generateBrief = useProjectStore((s) => s.generateBrief);
   const isGenerating = useProjectStore((s) => s.isGenerating);
   const isLoadingProject = useProjectStore((s) => s.isLoadingProject);
+  const definition = useProjectStore((s) => s.definition);
+
+  // AI-generated 5-8 sentence project description for the empty Brief page.
+  // Fetched once when the Brief is empty, cached in component state.
+  const [previewSummary, setPreviewSummary] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const chatSidebar = useChatSidebar('brief');
+  const chatMessageCount = useProjectStore((s) => (projectId ? s.briefChat[projectId]?.length ?? 0 : 0));
   // Project hydration is handled centrally by <ProjectWorkspace> in main.tsx —
   // do not call loadProject here or it will fight the workspace loader.
 
@@ -257,6 +353,27 @@ export function BriefPage() {
   const canApprove = openCount === 0;
   const isEmpty = !brief.summary && versions.length === 0;
   const isGen = isGenerating === 'brief';
+
+  // Fetch the AI-generated project description once when the Brief is empty.
+  // Skips the call when there's no source content at all (no raw input AND
+  // no uploaded attachments) so we don't spend an LLM call on an empty
+  // project. Refetches when projectId / rawInput / hasAttachments changes.
+  useEffect(() => {
+    if (!isEmpty || !projectId) return;
+    const hasSource = (definition.rawInput?.trim().length ?? 0) > 0 || definition.hasAttachments;
+    if (!hasSource) {
+      setPreviewSummary(null);
+      return;
+    }
+    let cancelled = false;
+    setPreviewLoading(true);
+    api
+      .get<{ summary: string }>(`/projects/${projectId}/brief/preview`)
+      .then((res) => { if (!cancelled) setPreviewSummary(res.summary); })
+      .catch(() => { if (!cancelled) setPreviewSummary(null); })
+      .finally(() => { if (!cancelled) setPreviewLoading(false); });
+    return () => { cancelled = true; };
+  }, [isEmpty, projectId, definition.rawInput, definition.hasAttachments]);
 
   function handleApprove() {
     navigate(`/projects/${projectId}/epics`);
@@ -305,47 +422,120 @@ export function BriefPage() {
                   )}
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
-                  {/* Generate button */}
-                  <Button
+                  {/* Regenerate — same violet gradient treatment used on Epics / Journeys / Tasks */}
+                  <button
                     onClick={() => projectId && void generateBrief(projectId)}
                     disabled={isGen}
-                    variant="outline"
-                    size="sm"
-                    className="gap-1.5"
+                    className="relative inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all duration-150 disabled:opacity-60 disabled:cursor-not-allowed group overflow-hidden"
+                    style={{
+                      background: 'linear-gradient(135deg, #7c3aed 0%, #9333ea 100%)',
+                      color: '#fff',
+                      boxShadow: '0 4px 14px -2px rgba(124,58,237,0.55), inset 0 1px 0 rgba(255,255,255,0.18)',
+                    }}
+                    onMouseEnter={(e) => {
+                      if (!e.currentTarget.disabled) {
+                        e.currentTarget.style.transform = 'translateY(-1px)';
+                        e.currentTarget.style.boxShadow = '0 6px 20px -2px rgba(124,58,237,0.7), inset 0 1px 0 rgba(255,255,255,0.25)';
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.transform = 'translateY(0)';
+                      e.currentTarget.style.boxShadow = '0 4px 14px -2px rgba(124,58,237,0.55), inset 0 1px 0 rgba(255,255,255,0.18)';
+                    }}
+                    title={isEmpty ? 'Generate the structured brief from the raw input' : 'Replace the current brief with a freshly-extracted one'}
                   >
-                    {isGen ? <Loader size={12} className="animate-spin" /> : <Sparkles size={12} />}
-                    {isEmpty ? 'Generate Brief' : 'Regenerate'}
-                  </Button>
+                    <span
+                      className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none"
+                      style={{
+                        background: 'linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.15) 50%, transparent 100%)',
+                      }}
+                    />
+                    {isGen ? (
+                      <>
+                        <Loader size={13} className="animate-spin relative z-10" />
+                        <span className="relative z-10">Generating…</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles size={13} className="relative z-10" />
+                        <span className="relative z-10">
+                          {isEmpty ? 'Generate Brief' : 'Regenerate'}
+                        </span>
+                      </>
+                    )}
+                  </button>
                   {/* Version history */}
                   <VersionDropdown
                     versions={versions}
                     onRestore={(v) => restoreBriefVersion(v)}
                   />
+                  <ShowChatButton hidden={chatSidebar.hidden} onShow={chatSidebar.show} count={chatMessageCount} />
                 </div>
               </div>
             </div>
 
-            {/* Empty state */}
-            {isEmpty && (
-              <div className="flex flex-col items-center justify-center py-20 text-center">
-                <div className="w-14 h-14 rounded-full flex items-center justify-center mb-4"
-                  style={{ background: 'rgba(124,58,237,0.1)', border: '1px solid rgba(124,58,237,0.2)' }}>
-                  <Sparkles size={22} style={{ color: 'var(--accent-text)' }} />
+            {/* Progress card — visible while the brief is being generated.
+                Same visual treatment as Epics/Journeys/Tasks pages. */}
+            {isGen && <BriefGenerationProgress />}
+
+            {/* Empty state — project name + an AI-generated 5-8 sentence
+                description of what the project is, its purpose, and what it
+                will do. The summary is read once via /brief/preview. Hidden
+                while a regen is in flight so the user focuses on the bar. */}
+            {isEmpty && !isGen && (() => {
+              // Source content can come from EITHER pasted raw text OR uploaded
+              // documents (PDF/DOCX/image text extracted server-side). Both feed
+              // into the brief generator the same way, so either is enough.
+              const hasRawInput = (definition.rawInput ?? '').trim().length > 0;
+              const hasContent = hasRawInput || definition.hasAttachments;
+              return (
+                <div className="max-w-2xl mx-auto py-20 text-center">
+                  <h2 className="text-xl font-bold mb-4" style={{ color: 'var(--text-primary)' }}>
+                    {definition.name || 'Your project'}
+                  </h2>
+                  {!hasContent ? (
+                    <p className="text-sm leading-relaxed mb-7" style={{ color: 'var(--warning-text)' }}>
+                      No source content yet. Add raw client input or upload a document on the Definition page first.
+                    </p>
+                  ) : previewLoading ? (
+                    <div className="flex items-center justify-center gap-2 mb-7" style={{ color: 'var(--text-dim)' }}>
+                      <Loader size={14} className="animate-spin" />
+                      <span className="text-sm">Reading the project…</span>
+                    </div>
+                  ) : (
+                    <p className="text-[15px] leading-7 mb-7 text-left" style={{ color: 'var(--text-secondary)', whiteSpace: 'pre-wrap' }}>
+                      {previewSummary ?? ' '}
+                    </p>
+                  )}
+                  <p className="text-xs mb-4" style={{ color: 'var(--text-dim)' }}>
+                    When you're ready, click below to generate the brief.
+                  </p>
+                  <button
+                    onClick={() => projectId && void generateBrief(projectId)}
+                    disabled={isGen || !hasContent}
+                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-bold transition-all duration-150 disabled:opacity-60 disabled:cursor-not-allowed"
+                    style={{
+                      background: 'linear-gradient(135deg, #7c3aed 0%, #9333ea 100%)',
+                      color: '#fff',
+                      boxShadow: '0 4px 14px -2px rgba(124,58,237,0.55), inset 0 1px 0 rgba(255,255,255,0.18)',
+                    }}
+                    onMouseEnter={(e) => {
+                      if (!e.currentTarget.disabled) {
+                        e.currentTarget.style.transform = 'translateY(-1px)';
+                        e.currentTarget.style.boxShadow = '0 6px 20px -2px rgba(124,58,237,0.7), inset 0 1px 0 rgba(255,255,255,0.25)';
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.transform = 'translateY(0)';
+                      e.currentTarget.style.boxShadow = '0 4px 14px -2px rgba(124,58,237,0.55), inset 0 1px 0 rgba(255,255,255,0.18)';
+                    }}
+                  >
+                    {isGen ? <Loader size={15} className="animate-spin" /> : <Sparkles size={15} />}
+                    {isGen ? 'Generating…' : 'Generate Brief'}
+                  </button>
                 </div>
-                <p className="text-sm font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>No brief yet</p>
-                <p className="text-xs mb-5" style={{ color: 'var(--text-muted)' }}>
-                  Click Generate Brief to extract a structured brief from the raw input.
-                </p>
-                <Button
-                  onClick={() => projectId && void generateBrief(projectId)}
-                  disabled={isGen}
-                  className="gap-2"
-                >
-                  {isGen ? <Loader size={14} className="animate-spin" /> : <Sparkles size={14} />}
-                  Generate Brief
-                </Button>
-              </div>
-            )}
+              );
+            })()}
 
             {!isEmpty && (
             <div>
@@ -451,17 +641,67 @@ export function BriefPage() {
 
         {/* Right sidebar */}
         {!isEmpty && <div className="shrink-0 p-5 flex flex-col gap-4 overflow-y-auto" style={{ width: '36%', borderLeft: '1px solid var(--border-subtle)', background: 'var(--bg-deep)' }}>
-          {/* Assumptions */}
-          <div>
-            <h3 className="text-[10px] font-semibold uppercase tracking-widest mb-3" style={{ color: 'var(--text-muted)' }}>Assumptions</h3>
+          {/* Assumptions — highlighted as the core artifact of this stage */}
+          <div
+            className="rounded-xl p-4 relative overflow-hidden"
+            style={{
+              background: 'linear-gradient(135deg, rgba(124,58,237,0.08), rgba(124,58,237,0.02))',
+              border: '1px solid rgba(124,58,237,0.28)',
+              boxShadow: '0 0 0 1px rgba(124,58,237,0.05), 0 4px 14px -4px rgba(124,58,237,0.18)',
+            }}
+          >
+            <div
+              className="absolute top-0 left-0 right-0 h-0.5"
+              style={{ background: 'linear-gradient(90deg, transparent, var(--accent), transparent)' }}
+            />
+            <div className="flex items-center gap-2.5 mb-4">
+              <div
+                className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0"
+                style={{
+                  background: 'rgba(250,204,21,0.18)',
+                  border: '1px solid rgba(250,204,21,0.45)',
+                  boxShadow: '0 0 14px rgba(250,204,21,0.4)',
+                }}
+              >
+                <Lightbulb
+                  size={15}
+                  fill="rgba(250,204,21,0.35)"
+                  style={{ color: '#facc15', filter: 'drop-shadow(0 0 4px rgba(250,204,21,0.7))' }}
+                />
+              </div>
+              <h3
+                className="text-sm font-bold tracking-wide flex-1"
+                style={{ color: 'var(--text-primary)', textShadow: '0 0 18px rgba(124,58,237,0.35)' }}
+              >
+                Assumptions
+              </h3>
+              <span
+                className="text-[10px] font-bold uppercase tracking-widest px-2 py-1 rounded-md"
+                style={{
+                  background: 'rgba(124,58,237,0.22)',
+                  color: 'var(--text-primary)',
+                  border: '1px solid rgba(124,58,237,0.45)',
+                }}
+              >
+                Core
+              </span>
+            </div>
             <ul className="space-y-2">
               {brief.assumptions.map((a) => (
                 <li
                   key={a.id}
-                  className="text-xs rounded-lg px-3 py-2.5 leading-relaxed"
-                  style={{ color: 'var(--text-muted)', background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border)' }}
+                  className="text-[13px] rounded-lg px-3 py-2.5 leading-relaxed flex items-start gap-2 font-medium"
+                  style={{
+                    color: 'var(--text-primary)',
+                    background: 'rgba(124,58,237,0.1)',
+                    border: '1px solid rgba(124,58,237,0.28)',
+                  }}
                 >
-                  {a.text}
+                  <span
+                    className="mt-1.5 shrink-0 w-1.5 h-1.5 rounded-full"
+                    style={{ background: 'var(--accent-text)', boxShadow: '0 0 6px rgba(124,58,237,0.6)' }}
+                  />
+                  <span className="flex-1">{a.text}</span>
                 </li>
               ))}
             </ul>
@@ -503,6 +743,19 @@ export function BriefPage() {
             </CardContent>
           </Card>
         </div>}
+
+        {/* Chat rail — hide/show + horizontal resize via useChatSidebar */}
+        {!isEmpty && (
+          <ChatSidebarColumn
+            projectId={projectId}
+            stage="brief"
+            hidden={chatSidebar.hidden}
+            width={chatSidebar.width}
+            isResizing={chatSidebar.isResizing}
+            onHide={chatSidebar.hide}
+            onResizeStart={chatSidebar.onResizeStart}
+          />
+        )}
       </div>
 
       {/* Sticky bottom bar: action row + challenge bar */}

@@ -27,6 +27,11 @@ export interface ProjectDefinition {
   contactPerson: string;
   rawInput: string;
   attachedFiles: AttachedFile[];
+  /** True when the server-side project row has extracted text from at least
+   *  one uploaded document. Lets the Brief page treat "no raw input but
+   *  attachments exist" as a valid source so the user can generate a brief
+   *  purely from a PDF/DOCX/image they uploaded. Hydrated on loadProject(). */
+  hasAttachments: boolean;
   provider: AIProvider;
 }
 
@@ -725,6 +730,7 @@ export const MOCK_PROJECT_DEFINITION: ProjectDefinition = {
   contactPerson: 'Sarah Johnson',
   rawInput: '',
   attachedFiles: [],
+  hasAttachments: false,
   provider: 'anthropic',
 };
 
