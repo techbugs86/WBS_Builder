@@ -7,6 +7,8 @@ import { Button } from '../components/ui/button';
 import { Badge } from '../components/ui/badge';
 import { Progress } from '../components/ui/progress';
 import { ScrollArea } from '../components/ui/scroll-area';
+import { ChatSidebarColumn, ShowChatButton } from '../components/ChatSidebarColumn';
+import { useChatSidebar } from '../hooks/useChatSidebar';
 import { api } from '../lib/api';
 import type { Domain } from '../data/mockData';
 import type { SyncLogEntry } from '../store/useProjectStore';
@@ -91,6 +93,8 @@ export function SyncPage() {
   const flaggedCount = tasks.filter((t) => t.status === 'flagged').length;
 
   const isSyncing = syncProgress > 0 && syncProgress < 100;
+  const chatSidebar = useChatSidebar('sync');
+  const chatMessageCount = useProjectStore((s) => (projectId ? s.syncChat[projectId]?.length ?? 0 : 0));
   const hasErrors = syncLog.some((entry) => entry.type === 'error');
   const isDone = syncProgress === 100 && !hasErrors;
   const isFailed = syncProgress === 100 && hasErrors;
@@ -156,9 +160,14 @@ export function SyncPage() {
   const remainingToSync = Math.max(0, approvedTasks.length - syncedApprovedCount);
   const allDone = approvedTasks.length > 0 && remainingToSync === 0;
 
+  // Auto-scroll the log container to its bottom when new entries arrive.
+  // `block: 'nearest'` keeps the scroll confined to the log's own scroll
+  // ancestor — without it, scrollIntoView bubbles up and yanks the entire
+  // page down on first mount (especially noticeable when navigating to this
+  // page from the Tasks page).
   useEffect(() => {
     if (logEndRef.current) {
-      logEndRef.current.scrollIntoView({ behavior: 'smooth' });
+      logEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
   }, [displayedLog]);
 
@@ -167,12 +176,14 @@ export function SyncPage() {
   }
 
   return (
+    <div className="flex h-full">
     <motion.div
-      className="py-8 px-8 w-full h-full overflow-y-auto"
+      className="flex-1 min-w-0 flex flex-col overflow-hidden"
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.2 }}
     >
+      <div className="flex-1 min-h-0 overflow-y-auto py-8 px-8">
       {/* Header */}
       <div className="mb-6">
         <div className="flex items-center gap-2 text-[var(--accent-text)] mb-3">
@@ -184,11 +195,14 @@ export function SyncPage() {
             <h1 className="text-2xl font-bold mb-1" style={{ color: 'var(--text-primary)' }}>Sync to ClickUp</h1>
             <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Push approved tasks to ClickUp. Flagged tasks are skipped.</p>
           </div>
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg" style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border)' }}>
-            <span className="w-2 h-2 rounded-full bg-violet-500 animate-pulse" />
-            <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
-              {definition.provider === 'anthropic' ? 'Claude Sonnet' : 'GPT-4o'}
-            </span>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg" style={{ background: 'var(--bg-overlay)', border: '1px solid var(--border)' }}>
+              <span className="w-2 h-2 rounded-full bg-violet-500 animate-pulse" />
+              <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                {definition.provider === 'anthropic' ? 'Claude Sonnet' : 'GPT-4o'}
+              </span>
+            </div>
+            <ShowChatButton hidden={chatSidebar.hidden} onShow={chatSidebar.show} count={chatMessageCount} />
           </div>
         </div>
       </div>
@@ -225,66 +239,6 @@ export function SyncPage() {
         </div>
       </div>
 
-      {/* Sync button + progress */}
-      <div className="rounded-xl p-6 mb-6" style={{ background: 'linear-gradient(135deg, var(--bg-card), var(--bg-card-alt))', border: '1px solid var(--border)' }}>
-        <div className="flex items-center gap-4">
-          {isDone ? (
-            <div className="flex items-center gap-2 px-5 py-2.5 bg-emerald-900/30 text-[var(--success-text)] border border-emerald-800/30 rounded-lg text-sm font-medium">
-              <CheckCircle size={15} />
-              Sync complete!
-            </div>
-          ) : isFailed ? (
-            <div className="flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium"
-              style={{ background: 'var(--error-bg)', color: 'var(--error-text)', border: '1px solid var(--error-border)' }}>
-              <AlertTriangle size={15} />
-              Sync failed — see log
-            </div>
-          ) : (
-            <Button
-              onClick={handleSync}
-              // Disabled when nothing approved yet OR everything is already synced.
-              disabled={isSyncing || approvedTasks.length === 0 || remainingToSync === 0}
-              size="lg"
-              className="gap-2 shrink-0"
-            >
-              {isSyncing ? (
-                <>
-                  <Loader size={15} className="animate-spin" />
-                  Syncing…
-                </>
-              ) : remainingToSync === 0 && approvedTasks.length > 0 ? (
-                <>
-                  <CheckCircle size={15} />
-                  All synced
-                </>
-              ) : (
-                <>
-                  <RefreshCw size={15} />
-                  Sync {remainingToSync} task{remainingToSync !== 1 ? 's' : ''} to ClickUp
-                </>
-              )}
-            </Button>
-          )}
-
-          {(isDone || isFailed) && (
-            <Button variant="ghost" size="sm" onClick={resetSync} className="gap-1.5">
-              <RotateCcw size={13} />
-              {isFailed ? 'Try again' : 'Reset'}
-            </Button>
-          )}
-
-          {(isSyncing || isDone || isFailed) && (
-            <div className="flex-1">
-              <div className="flex items-center justify-between text-xs mb-1.5" style={{ color: 'var(--text-muted)' }}>
-                <span>Sync progress</span>
-                <span className="font-mono">{syncProgress}%</span>
-              </div>
-              <Progress value={syncProgress} />
-            </div>
-          )}
-        </div>
-      </div>
-
       {/* Two-column layout */}
       <div className="grid grid-cols-2 gap-4">
         {/* Task table */}
@@ -304,7 +258,9 @@ export function SyncPage() {
             className="rounded-xl overflow-y-auto overflow-x-hidden"
             style={{
               border: '1px solid var(--border)',
-              maxHeight: '720px',
+              // ~15 rows visible (sticky header row + 15 body rows × ~36px each).
+              // Anything beyond scrolls inside the table.
+              maxHeight: '580px',
             }}
           >
             <table className="w-full text-xs">
@@ -384,6 +340,89 @@ export function SyncPage() {
           </div>
         </div>
       </div>
+      </div>
+
+      {/* Sticky footer — Sync button right-aligned, matches the rhythm of
+          Epics/Journeys/Tasks "Continue to …" footers. Progress bar + status
+          chips render to the left of the button only while sync is active. */}
+      <div
+        className="shrink-0 px-8 py-4 flex items-center gap-3 backdrop-blur-sm"
+        style={{
+          borderTop: '1px solid var(--border-subtle)',
+          background: 'color-mix(in srgb, var(--bg) 92%, transparent)',
+          boxShadow: '0 -6px 16px -10px rgba(0,0,0,0.6)',
+        }}
+      >
+        {(isSyncing || isDone || isFailed) && (
+          <div className="flex-1 max-w-md">
+            <div className="flex items-center justify-between text-xs mb-1.5" style={{ color: 'var(--text-muted)' }}>
+              <span>Sync progress</span>
+              <span className="font-mono">{syncProgress}%</span>
+            </div>
+            <Progress value={syncProgress} />
+          </div>
+        )}
+
+        {(isDone || isFailed) && (
+          <Button variant="ghost" size="sm" onClick={resetSync} className="gap-1.5">
+            <RotateCcw size={13} />
+            {isFailed ? 'Try again' : 'Reset'}
+          </Button>
+        )}
+
+        <div className="flex-1" />
+
+        {isDone ? (
+          <div className="flex items-center gap-2 px-5 py-2.5 bg-emerald-900/30 text-[var(--success-text)] border border-emerald-800/30 rounded-lg text-sm font-medium">
+            <CheckCircle size={15} />
+            Sync complete!
+          </div>
+        ) : isFailed ? (
+          <div
+            className="flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-medium"
+            style={{ background: 'var(--error-bg)', color: 'var(--error-text)', border: '1px solid var(--error-border)' }}
+          >
+            <AlertTriangle size={15} />
+            Sync failed — see log
+          </div>
+        ) : (
+          <Button
+            onClick={handleSync}
+            disabled={isSyncing || approvedTasks.length === 0 || remainingToSync === 0}
+            size="lg"
+            className="gap-2 shrink-0"
+          >
+            {isSyncing ? (
+              <>
+                <Loader size={15} className="animate-spin" />
+                Syncing…
+              </>
+            ) : remainingToSync === 0 && approvedTasks.length > 0 ? (
+              <>
+                <CheckCircle size={15} />
+                All synced
+              </>
+            ) : (
+              <>
+                <RefreshCw size={15} />
+                Sync {remainingToSync} task{remainingToSync !== 1 ? 's' : ''} to ClickUp
+              </>
+            )}
+          </Button>
+        )}
+      </div>
     </motion.div>
+
+    {/* Chat rail — hide/show + horizontal resize via useChatSidebar */}
+    <ChatSidebarColumn
+      projectId={projectId}
+      stage="sync"
+      hidden={chatSidebar.hidden}
+      width={chatSidebar.width}
+      isResizing={chatSidebar.isResizing}
+      onHide={chatSidebar.hide}
+      onResizeStart={chatSidebar.onResizeStart}
+    />
+    </div>
   );
 }

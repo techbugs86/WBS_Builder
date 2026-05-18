@@ -20,6 +20,21 @@ import {
   type PromptStage,
 } from '../data/mockData';
 import { api } from '../lib/api';
+import { diffEpics, summarizeEpicDiff } from '../lib/epicDiff';
+import { diffJourneys, summarizeJourneyDiff } from '../lib/journeyDiff';
+import { diffTasks, summarizeTaskDiff } from '../lib/taskDiff';
+import { reportClientError } from '../lib/errorReporter';
+
+export type ChatStage = 'epics' | 'journeys' | 'tasks' | 'brief' | 'definition' | 'sync';
+
+export interface EpicChatMessage {
+  id: string;
+  role: 'user' | 'agent';
+  text: string;
+  timestamp: number;
+}
+// Backward-compatibility alias — all stages share the same message shape.
+export type StageChatMessage = EpicChatMessage;
 
 export interface SyncLogEntry {
   id: string;
@@ -164,6 +179,43 @@ interface ProjectState {
   // Global notifications — surfaces store-action errors to the UI
   appError: string | null;
   setAppError: (msg: string | null) => void;
+  /**
+   * Set when loadProject fails (typically 404). ProjectWorkspace renders a
+   * "Project Not Found" screen when this is set for the current URL id, so
+   * the user doesn't see another project's stale data.
+   */
+  projectLoadError: { id: string; message: string } | null;
+  clearProjectLoadError: () => void;
+
+  // Per-stage chat history — keyed by stage then projectId. Persists to
+  // localStorage so conversations survive reloads.
+  epicChat: Record<string, EpicChatMessage[]>;
+  journeyChat: Record<string, EpicChatMessage[]>;
+  taskChat: Record<string, EpicChatMessage[]>;
+  briefChat: Record<string, EpicChatMessage[]>;
+  definitionChat: Record<string, EpicChatMessage[]>;
+  syncChat: Record<string, EpicChatMessage[]>;
+  appendEpicChat: (projectId: string, msg: Omit<EpicChatMessage, 'id' | 'timestamp'>) => void;
+  clearEpicChat: (projectId: string) => void;
+  appendStageChat: (stage: ChatStage, projectId: string, msg: Omit<EpicChatMessage, 'id' | 'timestamp'>) => void;
+  clearStageChat: (stage: ChatStage, projectId: string) => void;
+  /** Stage-aware agentic chat actions. */
+  chatAboutEpics: (message: string) => Promise<void>;
+  chatAboutJourneys: (message: string) => Promise<void>;
+  chatAboutTasks: (message: string) => Promise<void>;
+  chatAboutBrief: (message: string) => Promise<void>;
+  chatAboutDefinition: (message: string) => Promise<void>;
+  chatAboutSync: (message: string) => Promise<void>;
+  /** Append a brand-new item via the AI without touching the existing list. */
+  addEpic: (instruction: string) => Promise<void>;
+  addJourney: (instruction: string) => Promise<void>;
+  addTask: (instruction: string) => Promise<void>;
+  isEpicChatPending: boolean;
+  isJourneyChatPending: boolean;
+  isTaskChatPending: boolean;
+  isBriefChatPending: boolean;
+  isDefinitionChatPending: boolean;
+  isSyncChatPending: boolean;
 }
 
 const INITIAL_REGEN_STATE: RegenState = {
@@ -213,6 +265,46 @@ function loadStoredTheme(): 'dark' | 'light' {
   return theme;
 }
 
+const EPIC_CHAT_KEY = 'wbs_epic_chat';
+const JOURNEY_CHAT_KEY = 'wbs_journey_chat';
+const TASK_CHAT_KEY = 'wbs_task_chat';
+const BRIEF_CHAT_KEY = 'wbs_brief_chat';
+const DEFINITION_CHAT_KEY = 'wbs_definition_chat';
+const SYNC_CHAT_KEY = 'wbs_sync_chat';
+const STAGE_KEYS: Record<ChatStage, string> = {
+  epics: EPIC_CHAT_KEY,
+  journeys: JOURNEY_CHAT_KEY,
+  tasks: TASK_CHAT_KEY,
+  brief: BRIEF_CHAT_KEY,
+  definition: DEFINITION_CHAT_KEY,
+  sync: SYNC_CHAT_KEY,
+};
+
+function loadStoredChat(storageKey: string): Record<string, EpicChatMessage[]> {
+  try {
+    const raw = localStorage.getItem(storageKey);
+    return raw ? (JSON.parse(raw) as Record<string, EpicChatMessage[]>) : {};
+  } catch {
+    return {};
+  }
+}
+const loadStoredEpicChat = () => loadStoredChat(EPIC_CHAT_KEY);
+
+function persistEpicChat(map: Record<string, EpicChatMessage[]>): void {
+  persistStageChat('epics', map);
+}
+function persistStageChat(stage: ChatStage, map: Record<string, EpicChatMessage[]>): void {
+  try {
+    localStorage.setItem(STAGE_KEYS[stage], JSON.stringify(map));
+  } catch { /* quota or private-mode — ignore */ }
+}
+
+let epicChatMsgCounter = 0;
+function newEpicChatId(): string {
+  epicChatMsgCounter += 1;
+  return `${Date.now()}-${epicChatMsgCounter}`;
+}
+
 
 export const useProjectStore = create<ProjectState>((set, get) => ({
   activeProjectId: null,
@@ -233,6 +325,432 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   authError: null,
   promptConfigs: [],
   theme: loadStoredTheme(),
+  epicChat: loadStoredEpicChat(),
+  journeyChat: loadStoredChat(JOURNEY_CHAT_KEY),
+  taskChat: loadStoredChat(TASK_CHAT_KEY),
+  briefChat: loadStoredChat(BRIEF_CHAT_KEY),
+  definitionChat: loadStoredChat(DEFINITION_CHAT_KEY),
+  syncChat: loadStoredChat(SYNC_CHAT_KEY),
+  isEpicChatPending: false,
+  isJourneyChatPending: false,
+  isTaskChatPending: false,
+  isBriefChatPending: false,
+  isDefinitionChatPending: false,
+  isSyncChatPending: false,
+
+  appendStageChat: (stage, projectId, msg) => {
+    const full: EpicChatMessage = { id: newEpicChatId(), timestamp: Date.now(), ...msg };
+    set((state) => {
+      const sliceForStage = (s: typeof state): Record<string, EpicChatMessage[]> => {
+        if (stage === 'epics') return s.epicChat;
+        if (stage === 'journeys') return s.journeyChat;
+        if (stage === 'tasks') return s.taskChat;
+        if (stage === 'brief') return s.briefChat;
+        if (stage === 'definition') return s.definitionChat;
+        return s.syncChat;
+      };
+      const slice = sliceForStage(state);
+      const next = { ...slice, [projectId]: [...(slice[projectId] ?? []), full] };
+      persistStageChat(stage, next);
+      if (stage === 'epics') return { epicChat: next };
+      if (stage === 'journeys') return { journeyChat: next };
+      if (stage === 'tasks') return { taskChat: next };
+      if (stage === 'brief') return { briefChat: next };
+      if (stage === 'definition') return { definitionChat: next };
+      return { syncChat: next };
+    });
+  },
+
+  clearStageChat: (stage, projectId) => {
+    set((state) => {
+      const sliceForStage = (s: typeof state): Record<string, EpicChatMessage[]> => {
+        if (stage === 'epics') return s.epicChat;
+        if (stage === 'journeys') return s.journeyChat;
+        if (stage === 'tasks') return s.taskChat;
+        if (stage === 'brief') return s.briefChat;
+        if (stage === 'definition') return s.definitionChat;
+        return s.syncChat;
+      };
+      const slice = sliceForStage(state);
+      const next = { ...slice };
+      delete next[projectId];
+      persistStageChat(stage, next);
+      if (stage === 'epics') return { epicChat: next };
+      if (stage === 'journeys') return { journeyChat: next };
+      if (stage === 'tasks') return { taskChat: next };
+      if (stage === 'brief') return { briefChat: next };
+      if (stage === 'definition') return { definitionChat: next };
+      return { syncChat: next };
+    });
+  },
+
+  chatAboutEpics: async (message) => {
+    const pid = get().activeProjectId;
+    if (!pid) return;
+    const trimmed = message.trim();
+    if (!trimmed) return;
+
+    get().appendEpicChat(pid, { role: 'user', text: trimmed });
+
+    set({ isEpicChatPending: true });
+    let regenAll: string | undefined;
+    let rewriteOne: { epicId: string; epicTitle: string; instruction: string } | undefined;
+    let addOne: { instruction: string } | undefined;
+    let removeOne: { epicId: string; epicTitle: string } | undefined;
+    try {
+      const history = (get().epicChat[pid] ?? []).slice(-8).map((m) => ({ role: m.role, text: m.text }));
+      const res = await api.post<{
+        reply: string;
+        regenerate?: string;
+        rewriteOne?: { epicId: string; epicTitle: string; instruction: string };
+        addOne?: { instruction: string };
+        removeOne?: { epicId: string; epicTitle: string };
+      }>(`/projects/${pid}/epics/chat`, { message: trimmed, history });
+      get().appendEpicChat(pid, { role: 'agent', text: res.reply });
+      regenAll = res.regenerate;
+      rewriteOne = res.rewriteOne;
+      addOne = res.addOne;
+      removeOne = res.removeOne;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Chat reply failed.';
+      get().appendEpicChat(pid, { role: 'agent', text: `(Couldn't fetch a reply: ${msg})` });
+    } finally {
+      set({ isEpicChatPending: false });
+    }
+
+    // Dispatch the chosen action. Each branch pushes its own follow-up
+    // messages so the chat history reads naturally.
+    if (rewriteOne) {
+      try {
+        await get().rewriteItem('epic', rewriteOne.epicId, rewriteOne.instruction);
+      } catch {
+        get().appendEpicChat(pid, { role: 'agent', text: `(Couldn't rewrite "${rewriteOne.epicTitle}" — see error in the page header.)` });
+      }
+      return;
+    }
+
+    if (addOne) {
+      try {
+        await get().addEpic(addOne.instruction);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error';
+        get().appendEpicChat(pid, { role: 'agent', text: `(Couldn't add the new epic: ${msg})` });
+      }
+      return;
+    }
+
+    if (removeOne) {
+      try {
+        await get().deleteEpic(removeOne.epicId);
+        get().appendEpicChat(pid, { role: 'agent', text: `Removed "${removeOne.epicTitle}". The other epics are unchanged.` });
+      } catch {
+        get().appendEpicChat(pid, { role: 'agent', text: `(Couldn't remove "${removeOne.epicTitle}" — see error in the page header.)` });
+      }
+      return;
+    }
+
+    if (regenAll) {
+      try {
+        await get().challengeAI('epics', regenAll);
+      } catch {
+        /* challengeAI surfaces its own error via regenState.lastError */
+      }
+    }
+  },
+
+  addEpic: async (instruction) => {
+    const pid = get().activeProjectId;
+    if (!pid) throw new Error('No active project — cannot add epic.');
+    const res = await api.post<EpicWithHistory>(`/projects/${pid}/epics/add`, { instruction });
+    set((state) => ({ epics: [...state.epics, res] }));
+    get().appendEpicChat(pid, {
+      role: 'agent',
+      text: `Added a new epic "${res.current.title}" (${res.current.domain}, ${res.current.storyPoints} pts). The other epics are unchanged.`,
+    });
+  },
+
+  // ─── Journeys chat ────────────────────────────────────────────────────────
+
+  chatAboutJourneys: async (message) => {
+    const pid = get().activeProjectId;
+    if (!pid) return;
+    const trimmed = message.trim();
+    if (!trimmed) return;
+
+    get().appendStageChat('journeys', pid, { role: 'user', text: trimmed });
+    set({ isJourneyChatPending: true });
+    let regenAll: string | undefined;
+    let rewriteOne: { itemId: string; itemTitle: string; instruction: string } | undefined;
+    let addOne: { instruction: string } | undefined;
+    let removeOne: { itemId: string; itemTitle: string } | undefined;
+    try {
+      const history = (get().journeyChat[pid] ?? []).slice(-8).map((m) => ({ role: m.role, text: m.text }));
+      const res = await api.post<{
+        reply: string;
+        regenerate?: string;
+        rewriteOne?: { itemId: string; itemTitle: string; instruction: string };
+        addOne?: { instruction: string };
+        removeOne?: { itemId: string; itemTitle: string };
+      }>(`/projects/${pid}/journeys/chat`, { message: trimmed, history });
+      get().appendStageChat('journeys', pid, { role: 'agent', text: res.reply });
+      regenAll = res.regenerate;
+      rewriteOne = res.rewriteOne;
+      addOne = res.addOne;
+      removeOne = res.removeOne;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Chat reply failed.';
+      get().appendStageChat('journeys', pid, { role: 'agent', text: `(Couldn't fetch a reply: ${msg})` });
+    } finally {
+      set({ isJourneyChatPending: false });
+    }
+
+    if (rewriteOne) {
+      try {
+        const before = get().journeys.find((j) => j.current.id === rewriteOne!.itemId)?.current;
+        await get().rewriteItem('journey', rewriteOne.itemId, rewriteOne.instruction);
+        const after = get().journeys.find((j) => j.current.id === rewriteOne!.itemId)?.current;
+        if (before && after) {
+          const diff = diffJourneys([before], [after]);
+          get().appendStageChat('journeys', pid, { role: 'agent', text: summarizeJourneyDiff(diff) });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error';
+        get().appendStageChat('journeys', pid, { role: 'agent', text: `(Couldn't rewrite "${rewriteOne.itemTitle}": ${msg})` });
+      }
+      return;
+    }
+    if (addOne) {
+      try { await get().addJourney(addOne.instruction); }
+      catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error';
+        get().appendStageChat('journeys', pid, { role: 'agent', text: `(Couldn't add the new journey: ${msg})` });
+      }
+      return;
+    }
+    if (removeOne) {
+      try {
+        await get().deleteJourney(removeOne.itemId);
+        get().appendStageChat('journeys', pid, { role: 'agent', text: `Removed "${removeOne.itemTitle}". The other journeys are unchanged.` });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error';
+        get().appendStageChat('journeys', pid, { role: 'agent', text: `(Couldn't remove "${removeOne.itemTitle}": ${msg})` });
+      }
+      return;
+    }
+    if (regenAll) {
+      const before = get().journeys.map((j) => j.current);
+      try {
+        await get().generateJourneys(pid, regenAll);
+        const after = get().journeys.map((j) => j.current);
+        const diff = diffJourneys(before, after);
+        get().appendStageChat('journeys', pid, { role: 'agent', text: summarizeJourneyDiff(diff) });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error';
+        get().appendStageChat('journeys', pid, { role: 'agent', text: `Regeneration failed: ${msg}` });
+      }
+    }
+  },
+
+  addJourney: async (instruction) => {
+    const pid = get().activeProjectId;
+    if (!pid) throw new Error('No active project — cannot add journey.');
+    const res = await api.post<JourneyWithHistory>(`/projects/${pid}/journeys/add`, { instruction });
+    set((state) => ({ journeys: [...state.journeys, res] }));
+    get().appendStageChat('journeys', pid, {
+      role: 'agent',
+      text: `Added a new journey "${res.current.title}" (persona: ${res.current.persona}). The other journeys are unchanged.`,
+    });
+  },
+
+  // ─── Tasks chat ────────────────────────────────────────────────────────────
+
+  chatAboutTasks: async (message) => {
+    const pid = get().activeProjectId;
+    if (!pid) return;
+    const trimmed = message.trim();
+    if (!trimmed) return;
+
+    get().appendStageChat('tasks', pid, { role: 'user', text: trimmed });
+    set({ isTaskChatPending: true });
+    let regenAll: string | undefined;
+    let rewriteOne: { itemId: string; itemTitle: string; instruction: string } | undefined;
+    let addOne: { instruction: string } | undefined;
+    let removeOne: { itemId: string; itemTitle: string } | undefined;
+    try {
+      const history = (get().taskChat[pid] ?? []).slice(-8).map((m) => ({ role: m.role, text: m.text }));
+      const res = await api.post<{
+        reply: string;
+        regenerate?: string;
+        rewriteOne?: { itemId: string; itemTitle: string; instruction: string };
+        addOne?: { instruction: string };
+        removeOne?: { itemId: string; itemTitle: string };
+      }>(`/projects/${pid}/tasks/chat`, { message: trimmed, history });
+      get().appendStageChat('tasks', pid, { role: 'agent', text: res.reply });
+      regenAll = res.regenerate;
+      rewriteOne = res.rewriteOne;
+      addOne = res.addOne;
+      removeOne = res.removeOne;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Chat reply failed.';
+      get().appendStageChat('tasks', pid, { role: 'agent', text: `(Couldn't fetch a reply: ${msg})` });
+    } finally {
+      set({ isTaskChatPending: false });
+    }
+
+    if (rewriteOne) {
+      try {
+        const before = get().tasks.find((t) => t.current.id === rewriteOne!.itemId)?.current;
+        await get().rewriteItem('task', rewriteOne.itemId, rewriteOne.instruction);
+        const after = get().tasks.find((t) => t.current.id === rewriteOne!.itemId)?.current;
+        if (before && after) {
+          const diff = diffTasks([before], [after]);
+          get().appendStageChat('tasks', pid, { role: 'agent', text: summarizeTaskDiff(diff) });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error';
+        get().appendStageChat('tasks', pid, { role: 'agent', text: `(Couldn't rewrite "${rewriteOne.itemTitle}": ${msg})` });
+      }
+      return;
+    }
+    if (addOne) {
+      try { await get().addTask(addOne.instruction); }
+      catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error';
+        get().appendStageChat('tasks', pid, { role: 'agent', text: `(Couldn't add the new task: ${msg})` });
+      }
+      return;
+    }
+    if (removeOne) {
+      try {
+        await get().deleteTask(removeOne.itemId);
+        get().appendStageChat('tasks', pid, { role: 'agent', text: `Removed "${removeOne.itemTitle}". The other tasks are unchanged.` });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error';
+        get().appendStageChat('tasks', pid, { role: 'agent', text: `(Couldn't remove "${removeOne.itemTitle}": ${msg})` });
+      }
+      return;
+    }
+    if (regenAll) {
+      const before = get().tasks.map((t) => t.current);
+      try {
+        await get().generateTasks(pid, regenAll);
+        const after = get().tasks.map((t) => t.current);
+        const diff = diffTasks(before, after);
+        get().appendStageChat('tasks', pid, { role: 'agent', text: summarizeTaskDiff(diff) });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error';
+        get().appendStageChat('tasks', pid, { role: 'agent', text: `Regeneration failed: ${msg}` });
+      }
+    }
+  },
+
+  addTask: async (instruction) => {
+    const pid = get().activeProjectId;
+    if (!pid) throw new Error('No active project — cannot add task.');
+    const res = await api.post<TaskWithHistory>(`/projects/${pid}/tasks/add`, { instruction });
+    set((state) => ({ tasks: [...state.tasks, res] }));
+    get().appendStageChat('tasks', pid, {
+      role: 'agent',
+      text: `Added a new task "${res.current.title}" (${res.current.estimateHours}h). The other tasks are unchanged.`,
+    });
+  },
+
+  // ─── Brief chat ────────────────────────────────────────────────────────────
+
+  chatAboutBrief: async (message) => {
+    const pid = get().activeProjectId;
+    if (!pid) return;
+    const trimmed = message.trim();
+    if (!trimmed) return;
+    get().appendStageChat('brief', pid, { role: 'user', text: trimmed });
+    set({ isBriefChatPending: true });
+    let regenAll: string | undefined;
+    try {
+      const history = (get().briefChat[pid] ?? []).slice(-8).map((m) => ({ role: m.role, text: m.text }));
+      const res = await api.post<{ reply: string; regenerate?: string }>(`/projects/${pid}/brief/chat`, { message: trimmed, history });
+      get().appendStageChat('brief', pid, { role: 'agent', text: res.reply });
+      regenAll = res.regenerate;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Chat reply failed.';
+      get().appendStageChat('brief', pid, { role: 'agent', text: `(Couldn't fetch a reply: ${msg})` });
+    } finally {
+      set({ isBriefChatPending: false });
+    }
+    if (regenAll) {
+      try {
+        await get().generateBrief(pid, regenAll);
+        get().appendStageChat('brief', pid, {
+          role: 'agent',
+          text: 'Brief regenerated. Review the new summary, assumptions, and open questions.',
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'unknown error';
+        get().appendStageChat('brief', pid, { role: 'agent', text: `Brief regeneration failed: ${msg}` });
+      }
+    }
+  },
+
+  // ─── Definition chat ──────────────────────────────────────────────────────
+  // No mutations — agent advises on the form but the user owns the inputs.
+
+  chatAboutDefinition: async (message) => {
+    const pid = get().activeProjectId;
+    if (!pid) return;
+    const trimmed = message.trim();
+    if (!trimmed) return;
+    get().appendStageChat('definition', pid, { role: 'user', text: trimmed });
+    set({ isDefinitionChatPending: true });
+    try {
+      const history = (get().definitionChat[pid] ?? []).slice(-8).map((m) => ({ role: m.role, text: m.text }));
+      const res = await api.post<{ reply: string }>(`/projects/${pid}/definition/chat`, { message: trimmed, history });
+      get().appendStageChat('definition', pid, { role: 'agent', text: res.reply });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Chat reply failed.';
+      get().appendStageChat('definition', pid, { role: 'agent', text: `(Couldn't fetch a reply: ${msg})` });
+    } finally {
+      set({ isDefinitionChatPending: false });
+    }
+  },
+
+  // ─── Sync chat ─────────────────────────────────────────────────────────────
+  // Discussion-only — actual sync still triggered by the Sync button on the page.
+
+  chatAboutSync: async (message) => {
+    const pid = get().activeProjectId;
+    if (!pid) return;
+    const trimmed = message.trim();
+    if (!trimmed) return;
+    get().appendStageChat('sync', pid, { role: 'user', text: trimmed });
+    set({ isSyncChatPending: true });
+    try {
+      const history = (get().syncChat[pid] ?? []).slice(-8).map((m) => ({ role: m.role, text: m.text }));
+      const res = await api.post<{ reply: string }>(`/projects/${pid}/sync/chat`, { message: trimmed, history });
+      get().appendStageChat('sync', pid, { role: 'agent', text: res.reply });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Chat reply failed.';
+      get().appendStageChat('sync', pid, { role: 'agent', text: `(Couldn't fetch a reply: ${msg})` });
+    } finally {
+      set({ isSyncChatPending: false });
+    }
+  },
+
+  appendEpicChat: (projectId, msg) => {
+    const full: EpicChatMessage = { id: newEpicChatId(), timestamp: Date.now(), ...msg };
+    set((state) => {
+      const next = { ...state.epicChat, [projectId]: [...(state.epicChat[projectId] ?? []), full] };
+      persistEpicChat(next);
+      return { epicChat: next };
+    });
+  },
+
+  clearEpicChat: (projectId) => {
+    set((state) => {
+      const next = { ...state.epicChat };
+      delete next[projectId];
+      persistEpicChat(next);
+      return { epicChat: next };
+    });
+  },
 
   // ─── Definition ───────────────────────────────────────────────────────────
 
@@ -637,6 +1155,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
     try {
       if (itemType === 'epic') {
+        const before = get().epics.find((e) => e.current.id === itemId)?.current;
         const res = await api.post<EpicWithHistory>(
           `/projects/${pid}/epics/${itemId}/rewrite`,
           { instruction: prompt },
@@ -644,6 +1163,13 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         set((state) => ({
           epics: state.epics.map((e) => (e.current.id === itemId ? res : e)),
         }));
+        // Push to the per-project epic chat: user prompt + agent diff note.
+        if (before) {
+          get().appendEpicChat(pid, { role: 'user', text: `Rewrite "${before.title}": ${prompt}` });
+          const diff = diffEpics([before], [res.current]);
+          const note = summarizeEpicDiff(diff);
+          get().appendEpicChat(pid, { role: 'agent', text: note });
+        }
       } else if (itemType === 'journey') {
         const res = await api.post<JourneyWithHistory>(
           `/projects/${pid}/journeys/${itemId}/rewrite`,
@@ -728,6 +1254,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         default:         return new Set<string>();
       }
     })();
+    // Full snapshot used by the Epics chat history to produce a content-level diff.
+    const epicsBefore = stage === 'epics' ? get().epics.map((e) => e.current) : [];
 
     try {
       if (stage === 'brief') {
@@ -764,6 +1292,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
             diffSummary: `${after.length} epic${after.length !== 1 ? 's' : ''} regenerated`,
           },
         }));
+        // Push user instruction + agent diff note to the Epics chat.
+        get().appendEpicChat(pid, { role: 'user', text });
+        const diff = diffEpics(epicsBefore, after.map((e) => e.current));
+        get().appendEpicChat(pid, { role: 'agent', text: summarizeEpicDiff(diff) });
       } else if (stage === 'journeys') {
         await get().generateJourneys(pid, text);
         const after = get().journeys;
@@ -793,6 +1325,16 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       set((state) => ({
         regenState: { ...state.regenState, lastError: msg, diffSummary: '' },
       }));
+      reportClientError({ module: 'store.challengeAI', message: msg, err, context: { projectId: pid, stage, text } });
+      // Surface the failure inline in the Epics chat so the user sees
+      // a real explanation instead of a stale "no changes detected" message
+      // from a diff that never had new data to compare.
+      if (stage === 'epics') {
+        get().appendEpicChat(pid, {
+          role: 'agent',
+          text: `Regeneration failed: ${msg}\n\nThe epic list was not changed. You can try again with a more specific instruction, or check Admin → Integrations if the AI provider is misconfigured.`,
+        });
+      }
       // Re-throw so the caller (ChallengeBar) can display its own UI feedback.
       throw err;
     } finally {
@@ -892,6 +1434,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to load projects.';
       set({ appError: msg });
+      reportClientError({ module: 'store.loadProjects', message: msg, err });
     } finally {
       set({ isLoadingProjects: false });
     }
@@ -914,8 +1457,13 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     return res.id;
   },
 
+  projectLoadError: null,
+  clearProjectLoadError: () => set({ projectLoadError: null }),
+
   loadProject: async (id) => {
-    set({ isLoadingProject: true, activeProjectId: id });
+    // Reset the not-found flag so we don't render the error screen for the
+    // previous failed id while the new fetch is in flight.
+    set({ isLoadingProject: true, activeProjectId: id, projectLoadError: null });
     try {
       // Fetch in parallel but TOLERATE partial failures: a missing brief or
       // empty epics list should not prevent the Definition form from showing.
@@ -944,7 +1492,24 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       // The project itself is required — without it, we have no definition data to show.
       if (projectRes.status !== 'fulfilled') {
         const msg = projectRes.reason instanceof Error ? projectRes.reason.message : 'Failed to load project.';
-        set({ appError: `Could not load project: ${msg}` });
+        // Wipe stale state so the previously-loaded project's data doesn't
+        // leak into the UI for an id that doesn't exist.
+        set({
+          appError: null,
+          projectLoadError: { id, message: msg },
+          definition: MOCK_PROJECT_DEFINITION,
+          brief: EMPTY_BRIEF,
+          epics: [],
+          journeys: [],
+          tasks: [],
+          activeProjectId: null,
+        });
+        reportClientError({
+          module: 'store.loadProject',
+          message: `Project not found or failed to load: ${msg}`,
+          err: projectRes.reason,
+          context: { projectId: id, path: typeof window !== 'undefined' ? window.location.pathname : undefined },
+        });
         return;
       }
 
@@ -976,6 +1541,11 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         contactPerson: (project['contact_person'] as string) ?? '',
         rawInput: (project['raw_input'] as string) ?? '',
         attachedFiles: [],
+        // Server returns attachments_text as the concatenated extracted text
+        // from all uploaded documents (or null if none). Just expose the
+        // presence as a boolean — the brief generator on the server already
+        // reads the full text directly from the project row.
+        hasAttachments: typeof project['attachments_text'] === 'string' && (project['attachments_text'] as string).trim().length > 0,
         provider: ((project['provider'] as ProjectDefinition['provider']) ?? 'anthropic'),
       };
 
@@ -994,13 +1564,20 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   deleteProject: async (id) => {
     try {
       await api.del(`/projects/${id}`);
-      set((state) => ({
-        savedProjects: state.savedProjects.filter((p) => p.id !== id),
-        activeProjectId: state.activeProjectId === id ? null : state.activeProjectId,
-      }));
+      set((state) => {
+        const nextChat = { ...state.epicChat };
+        delete nextChat[id];
+        persistEpicChat(nextChat);
+        return {
+          savedProjects: state.savedProjects.filter((p) => p.id !== id),
+          activeProjectId: state.activeProjectId === id ? null : state.activeProjectId,
+          epicChat: nextChat,
+        };
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to delete project.';
       set({ appError: msg });
+      reportClientError({ module: 'store.deleteProject', message: msg, err, context: { projectId: id } });
       throw err;
     }
   },
@@ -1025,6 +1602,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to save project.';
       set({ appError: msg });
+      reportClientError({ module: 'store.saveProject', message: msg, err, context: { projectId: id } });
       throw err;
     }
   },
@@ -1044,6 +1622,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to generate brief.';
       set({ appError: `Brief generation failed: ${msg}` });
+      reportClientError({ module: 'store.generateBrief', message: msg, err, context: { projectId: id, challengeText } });
     } finally {
       set({ isGenerating: null });
     }
@@ -1051,13 +1630,36 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
   generateEpics: async (id, challengeText) => {
     set({ isGenerating: 'epics' });
+
+    // Poll GET /epics every 2s so the UI counter ticks up the instant the
+    // backend completes its batch insert. Less useful than for journeys/tasks
+    // (epic gen is one LLM call → inserts happen at the very end) but mirrors
+    // the same UX pattern and surfaces partial state if the backend ever
+    // adopts incremental inserts.
+    const MAX_POLLS = 90;
+    let pollCount = 0;
+    const pollHandle = setInterval(async () => {
+      if (++pollCount > MAX_POLLS) { clearInterval(pollHandle); return; }
+      try {
+        const fresh = await api.get<EpicWithHistory[]>(`/projects/${id}/epics`);
+        if (Array.isArray(fresh) && fresh.length > 0) {
+          set({ epics: fresh });
+        }
+      } catch {
+        // Ignore poll errors — the POST will surface real failures.
+      }
+    }, 700);
+
     try {
       const res = await api.post<EpicWithHistory[]>(`/projects/${id}/epics/generate`, { challengeText: challengeText ?? '' });
       set({ epics: res });
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to generate epics.';
       set({ appError: `Epic generation failed: ${msg}` });
+      reportClientError({ module: 'store.generateEpics', message: msg, err, context: { projectId: id, challengeText } });
+      throw err;
     } finally {
+      clearInterval(pollHandle);
       set({ isGenerating: null });
     }
   },
@@ -1087,6 +1689,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to generate journeys.';
       set({ appError: `Journey generation failed: ${msg}` });
+      reportClientError({ module: 'store.generateJourneys', message: msg, err, context: { projectId: id, challengeText } });
     } finally {
       clearInterval(pollHandle);
       set({ isGenerating: null });
@@ -1132,6 +1735,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to generate tasks.';
       set({ appError: `Task generation failed: ${msg}` });
+      reportClientError({ module: 'store.generateTasks', message: msg, err, context: { projectId: id, challengeText } });
     } finally {
       clearInterval(pollHandle);
       set({ isGenerating: null });

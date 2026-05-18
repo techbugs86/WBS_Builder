@@ -91,15 +91,15 @@ export function VersionDropdown<T>({ versions, onRestore, isUpdated = false }: V
       <button
         ref={triggerRef}
         onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs transition-colors hover:bg-violet-950/20"
+        className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-bold transition-colors hover:bg-violet-950/20"
         style={{
           background: 'var(--bg-elevated)',
           border: '1px solid var(--border)',
           color: 'var(--text-muted)',
         }}
       >
-        <span className="font-mono font-bold text-violet-400">v{currentVersion}</span>
-        <ChevronDown size={12} />
+        <span className="font-mono text-violet-400">v{currentVersion}</span>
+        <ChevronDown size={13} />
       </button>
 
       {/* "Updated" badge */}

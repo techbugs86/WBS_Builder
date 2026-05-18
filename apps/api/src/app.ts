@@ -5,7 +5,9 @@ import { promptsRouter } from './routes/prompts.js';
 import { settingsRouter } from './routes/settings.js';
 import { projectsRouter } from './routes/projects.js';
 import { usersRouter } from './routes/users.js';
+import { logsRouter } from './routes/logs.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import { logErrorFireAndForget } from './lib/errorLog.js';
 
 export const app = express();
 
@@ -16,6 +18,7 @@ app.use('/auth', authRouter);
 app.use('/admin/prompts', promptsRouter);
 app.use('/admin/settings', settingsRouter);
 app.use('/admin/users', usersRouter);
+app.use('/admin/logs', logsRouter);
 app.use('/projects', projectsRouter);
 
 app.get('/health', (_req, res) => {
@@ -35,7 +38,23 @@ app.use(errorHandler);
 // the process silently. (tsx watch will continue running.)
 process.on('unhandledRejection', (reason) => {
   console.error('[api:unhandledRejection]', reason);
+  logErrorFireAndForget({
+    level: 'error',
+    source: 'backend',
+    module: 'process',
+    message: reason instanceof Error ? reason.message : String(reason),
+    context: { kind: 'unhandledRejection' },
+    stack: reason instanceof Error ? reason.stack : undefined,
+  });
 });
 process.on('uncaughtException', (err) => {
   console.error('[api:uncaughtException]', err);
+  logErrorFireAndForget({
+    level: 'error',
+    source: 'backend',
+    module: 'process',
+    message: err.message,
+    context: { kind: 'uncaughtException' },
+    stack: err.stack,
+  });
 });
