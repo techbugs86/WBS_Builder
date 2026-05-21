@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { useNavigate, useParams } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { CheckCircle, Layers, ArrowRight, Edit2, Sparkles, Loader, Trash2, ChevronDown, ChevronUp, MessageSquare, PanelRightOpen } from 'lucide-react';
+import { CheckCircle, Layers, ArrowRight, Edit2, Sparkles, Loader, Trash2, ChevronDown, ChevronUp, MessageSquare } from 'lucide-react';
 import { useProjectStore } from '../store/useProjectStore';
 import { Button } from '../components/ui/button';
 import { Badge } from '../components/ui/badge';

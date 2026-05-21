@@ -96,13 +96,6 @@ export function EpicChallengeBar() {
     }
   }
 
-  function toggleMode() {
-    setManualMode((m) => {
-      const next: Mode = (m ?? detectedMode) === 'regenerate' ? 'chat' : 'regenerate';
-      return next;
-    });
-  }
-
   const phaseLabel =
     regenState.progress < 30 ? 'Reading instruction…'
     : regenState.progress < 70 ? 'Regenerating epics…'
