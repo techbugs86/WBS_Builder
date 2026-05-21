@@ -11,6 +11,7 @@ import { syncProjectToClickUp } from '../clickup/sync.js';
 import { SELECTABLE_PROJECT_TYPES } from '../constants/enums.js';
 import { sortEpicsByPriority } from '../lib/sortEpics.js';
 import { extractAttachmentText } from '../lib/attachmentExtractor.js';
+import { recordRegenEvent, getMostRecentRegenEvent, formatRegenContextForChat, recordBriefRegenEvent, getMostRecentBriefRegenEvent, formatBriefRegenContextForChat, diffBriefSnapshots } from '../lib/regenEvents.js';
 import multer from 'multer';
 
 function safeJsonParse<T>(raw: unknown, fallback: T): T {
@@ -541,6 +542,14 @@ projectsRouter.post('/:id/brief/generate', asyncHandler(async (req, res) => {
   const { systemPrompt, userTemplate } = await getPromptConfig('brief_extraction', req.user!.orgId, promptType(project.project_type));
   const challengeText = (req.body as { challengeText?: string }).challengeText ?? '';
 
+  // Snapshot the previous brief (if any) so we can record a regen diff
+  // for the chat module to answer "what changed?".
+  const previousBriefRow = await queryOne<BriefRow>(
+    'SELECT * FROM briefs WHERE project_id = ? AND is_current = 1',
+    [req.params['id']],
+  );
+  const previousBrief = previousBriefRow ? safeJsonParse<Brief>(previousBriefRow.data, {} as Brief) : null;
+
   // Source text = raw_input + extracted attachments (concatenated). The
   // brief extractor reads them as one document — same code path for typed
   // notes and uploaded scope docs.
@@ -578,6 +587,14 @@ projectsRouter.post('/:id/brief/generate', asyncHandler(async (req, res) => {
 
   // Update project updated_at
   await execute('UPDATE projects SET updated_at = NOW() WHERE id = ?', [req.params['id']]);
+
+  // Log this regen so the chat module can answer "what changed?".
+  await recordBriefRegenEvent(
+    req.params['id'] as string,
+    previousBrief,
+    brief as unknown as { summary?: string; inScope?: string[]; outOfScope?: string[]; assumptions?: Array<{ text?: string }>; openQuestions?: Array<{ text?: string }> },
+    challengeText,
+  );
 
   const versions = await query<BriefRow>(
     'SELECT * FROM briefs WHERE project_id = ? ORDER BY version ASC',
@@ -852,14 +869,29 @@ projectsRouter.get('/:id/epics', async (req, res) => {
   );
   if (currentRows.length === 0) { res.json([]); return; }
 
+  // Deterministic priority sort (Auth → other foundations → core value →
+  // supporting → growth). The DB-level created_at rewrite from generate is
+  // unreliable because `created_at` is DATETIME (whole-second precision),
+  // so multiple inserts within the same second collapse to identical
+  // timestamps and MySQL no longer guarantees deterministic order. Sorting
+  // here means generate / regenerate / addOne via chat / restore / page
+  // revisit all return the same canonical top-to-bottom order.
+  const parsed = currentRows.map((row) => ({
+    row,
+    epic: (typeof row.data === 'string' ? JSON.parse(row.data) : row.data) as Epic,
+  }));
+  const sortedEpics = sortEpicsByPriority(parsed.map((p) => p.epic));
+  const rowByEpicId = new Map(parsed.map((p) => [p.epic.id, p.row]));
+
   const result = await Promise.all(
-    currentRows.map(async (row) => {
+    sortedEpics.map(async (epic) => {
+      const row = rowByEpicId.get(epic.id)!;
       const versions = await query<EpicRow>(
         'SELECT * FROM epics WHERE epic_key = ? ORDER BY version ASC',
         [row.epic_key],
       );
       return {
-        current: typeof row.data === 'string' ? JSON.parse(row.data) : row.data,
+        current: epic,
         versions: toVersionHistory(versions),
       };
     }),
@@ -879,36 +911,63 @@ projectsRouter.post('/:id/epics/generate', asyncHandler(async (req, res) => {
   const { systemPrompt, userTemplate } = await getPromptConfig('epic_generation', req.user!.orgId, promptType(project.project_type));
   const challengeText = (req.body as { challengeText?: string }).challengeText ?? '';
 
+  // Snapshot the BEFORE state so we can record a regen diff once the new
+  // epics are in place. The chat module reads this to answer "what changed?".
+  const beforeEpicsRows = await query<EpicRow>(
+    'SELECT data FROM epics WHERE project_id = ? AND is_current = 1',
+    [req.params['id']],
+  );
+  const beforeEpics = beforeEpicsRows
+    .map((r) => safeJsonParse<Epic>(r.data, {} as Epic))
+    .filter((e) => e && e.title);
+
   // Deactivate existing epics upfront so polling returns an empty list while
   // we're streaming in the new ones.
   await execute('UPDATE epics SET is_current = 0 WHERE project_id = ?', [req.params['id']]);
 
-  // Stream epics tier-by-tier: 3 sequential LLM calls (foundation → core →
-  // supporting/growth). After each call we insert that tier's epics so the
-  // frontend polling picks them up — same UX as journey/task generation.
+  // Parallelize the 3 tier LLM calls (foundation || core || supporting/growth).
+  // Sequential generation was ~90s wall-clock (3 × ~30s per tier); running
+  // them concurrently brings that down to roughly the slowest single tier
+  // (~30s). The trade-off: each tier no longer sees the other tiers' output
+  // for the "don't duplicate" guard. The per-tier system prompt already
+  // pins each one to a specific scope (foundation / core / supporting+growth)
+  // so cross-tier duplication is rare in practice, and the final priority
+  // sort + add/remove chat actions let the PM clean up if it happens.
+  //
+  // Each tier still INSERTS its epics as soon as it resolves, so the
+  // frontend's polling continues to see epics streaming in as tiers
+  // complete (in whatever order they finish — usually all within a
+  // few seconds of each other).
   const provider = project.provider as 'anthropic' | 'openai';
-  const tiers: Array<'foundation' | 'core_value' | 'supporting_growth'> = ['foundation', 'core_value', 'supporting_growth'];
-  const all: Epic[] = [];
+  const projectId = req.params['id'] as string;
 
-  for (const tier of tiers) {
-    console.log(`[epics/generate] starting tier=${tier} (have ${all.length} so far)`);
-    let batch: Epic[];
+  async function runTier(tier: 'foundation' | 'core_value' | 'supporting_growth'): Promise<Epic[]> {
+    console.log(`[epics/generate] starting tier=${tier} (parallel)`);
     try {
-      batch = await generateEpicsForTier(brief, provider, systemPrompt, challengeText, tier, all);
+      const batch = await generateEpicsForTier(brief, provider, systemPrompt, challengeText, tier, []);
+      // Insert this tier's epics immediately so the frontend poll sees them
+      // — no waiting for the slowest tier.
+      for (const epic of batch) {
+        await execute(
+          'INSERT INTO epics (id, project_id, epic_key, version, is_current, data, label) VALUES (?, ?, ?, 1, 1, ?, ?)',
+          [uuid(), projectId, epic.id, JSON.stringify(epic), 'AI Generated v1'],
+        );
+      }
+      console.log(`[epics/generate] tier=${tier} produced ${batch.length} epics`);
+      return batch;
     } catch (err) {
-      // If a single tier fails, log + continue. Other tiers may still succeed.
+      // One tier failing no longer blocks the others — they already ran in parallel.
       console.warn(`[epics/generate] tier=${tier} failed:`, err instanceof Error ? err.message : err);
-      continue;
+      return [];
     }
-    console.log(`[epics/generate] tier=${tier} produced ${batch.length} epics`);
-    for (const epic of batch) {
-      await execute(
-        'INSERT INTO epics (id, project_id, epic_key, version, is_current, data, label) VALUES (?, ?, ?, 1, 1, ?, ?)',
-        [uuid(), req.params['id'], epic.id, JSON.stringify(epic), 'AI Generated v1'],
-      );
-    }
-    all.push(...batch);
   }
+
+  const [foundationBatch, coreBatch, supportingBatch] = await Promise.all([
+    runTier('foundation'),
+    runTier('core_value'),
+    runTier('supporting_growth'),
+  ]);
+  const all: Epic[] = [...foundationBatch, ...coreBatch, ...supportingBatch];
 
   // If every tier failed and we have zero epics, treat as a hard error.
   if (all.length === 0) {
@@ -933,11 +992,33 @@ projectsRouter.post('/:id/epics/generate', asyncHandler(async (req, res) => {
 
   await execute('UPDATE projects SET updated_at = NOW() WHERE id = ?', [req.params['id']]);
 
+  // Log this regen so the chat module can answer "what changed?" with a
+  // concrete add/remove list. Best-effort — failures don't affect the
+  // user-visible result.
+  await recordRegenEvent(
+    req.params['id'] as string,
+    'epics',
+    beforeEpics.map((e) => ({ title: e.title })),
+    sorted.map((e) => ({ title: e.title })),
+    challengeText,
+  );
+
   const saved = await query<EpicRow>('SELECT * FROM epics WHERE project_id = ? AND is_current = 1 ORDER BY created_at ASC', [req.params['id']]);
-  res.json(saved.map((r) => ({
-    current: typeof r.data === 'string' ? JSON.parse(r.data) : r.data,
-    versions: [{ version: 1, label: 'AI Generated v1', challengeText: '', createdAt: r.created_at, data: typeof r.data === 'string' ? JSON.parse(r.data) : r.data }],
-  })));
+  // Same deterministic sort as GET /:id/epics — guarantees the response is
+  // top-to-bottom prioritized regardless of insertion-order timing.
+  const savedParsed = saved.map((r) => ({
+    r,
+    epic: (typeof r.data === 'string' ? JSON.parse(r.data) : r.data) as Epic,
+  }));
+  const savedSorted = sortEpicsByPriority(savedParsed.map((p) => p.epic));
+  const rByEpic = new Map(savedParsed.map((p) => [p.epic.id, p.r]));
+  res.json(savedSorted.map((epic) => {
+    const r = rByEpic.get(epic.id)!;
+    return {
+      current: epic,
+      versions: [{ version: 1, label: 'AI Generated v1', challengeText: '', createdAt: r.created_at, data: epic }],
+    };
+  }));
 }));
 
 // PATCH /projects/:id/epics/:epicKey
@@ -1014,8 +1095,13 @@ projectsRouter.post('/:id/epics/:epicKey/rewrite', asyncHandler(async (req, res)
   res.json({ current: rewritten, versions: toVersionHistory(versions) });
 }));
 
-// POST /projects/:id/brief/chat — conversational reply about the brief; may
-// return regenerate=<instruction> for full brief regen.
+// POST /projects/:id/brief/chat — conversational reply about the brief.
+// For mutating actions (add/remove/rewrite assumption, open question, scope
+// item, summary) the route executes the mutation server-side, writes a new
+// brief version, and returns the fresh brief so the frontend can refresh
+// its state in one round-trip.
+// For `regenerateAll` the route returns the instruction string and the
+// frontend dispatches its existing generateBrief() flow.
 projectsRouter.post('/:id/brief/chat', asyncHandler(async (req, res) => {
   const project = req.project as unknown as ProjectRow;
   const briefRow = await queryOne<BriefRow>('SELECT * FROM briefs WHERE project_id = ? AND is_current = 1', [req.params['id']]);
@@ -1025,22 +1111,174 @@ projectsRouter.post('/:id/brief/chat', asyncHandler(async (req, res) => {
   if (!message) { res.status(400).json({ error: 'message is required.' }); return; }
   const brief = safeJsonParse<Brief>(briefRow.data, {} as Brief);
   const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
-  let result;
-  try { result = await chatAboutBrief(project.provider as 'anthropic' | 'openai', brief, message, history); }
+
+  // For "what changed?" questions, diff the current brief against the most
+  // recently deactivated version straight from the briefs table. This works
+  // for ALL existing projects (no dependency on regen_events being populated
+  // from this session forward) — version history was always being kept
+  // append-only, we just weren't reading from it.
+  //
+  // We also check the regen_events table as a secondary source so the
+  // assistant can quote the user's last regeneration instruction when one
+  // was recorded (useful context, but not essential).
+  const previousBriefRow = await queryOne<BriefRow>(
+    'SELECT * FROM briefs WHERE project_id = ? AND is_current = 0 ORDER BY version DESC LIMIT 1',
+    [req.params['id']],
+  );
+  let regenContext = '';
+  if (previousBriefRow) {
+    const previousBrief = safeJsonParse<Brief>(previousBriefRow.data, {} as Brief);
+    const recentBriefRegen = await getMostRecentBriefRegenEvent(req.params['id'] as string);
+    regenContext = formatBriefRegenContextForChat({
+      summary: diffBriefSnapshots(
+        previousBrief as unknown as { summary?: string; inScope?: string[]; outOfScope?: string[]; assumptions?: Array<{ text?: string }>; openQuestions?: Array<{ text?: string }> },
+        brief as unknown as { summary?: string; inScope?: string[]; outOfScope?: string[]; assumptions?: Array<{ text?: string }>; openQuestions?: Array<{ text?: string }> },
+      ),
+      instruction: recentBriefRegen?.instruction ?? null,
+      createdAt: previousBriefRow.created_at,
+    });
+  }
+
+  let chatResult;
+  try { chatResult = await chatAboutBrief(project.provider as 'anthropic' | 'openai', brief, message, history, regenContext); }
   catch (err) { throw llmErrorToHttp(err); }
-  res.json(result);
+
+  const { reply, action } = chatResult;
+
+  // `regenerateAll` is dispatched by the frontend — return the legacy shape
+  // (`regenerate` string) so the existing client code path still works.
+  if (action.type === 'regenerateAll') {
+    res.json({ reply, action, regenerate: action.instruction });
+    return;
+  }
+
+  // No mutation — pure chat. Return reply + action='none' + the current brief.
+  if (action.type === 'none') {
+    res.json({
+      reply,
+      action,
+      brief: { current: brief, versions: toVersionHistory(await query<BriefRow>('SELECT * FROM briefs WHERE project_id = ? ORDER BY version ASC', [req.params['id']])) },
+    });
+    return;
+  }
+
+  // Apply the mutation to a working copy of the brief, then save as a new
+  // version. We keep the brief data structure stable (id-bearing assumptions
+  // and open questions) so the frontend never has to reconcile shape diffs.
+  const next: Brief = JSON.parse(JSON.stringify(brief));
+
+  switch (action.type) {
+    case 'rewriteSummary':
+      next.summary = action.text;
+      break;
+    case 'addAssumption':
+      next.assumptions = [...(next.assumptions ?? []), { id: uuid(), text: action.text }];
+      break;
+    case 'removeAssumption': {
+      const list = next.assumptions ?? [];
+      if (action.index >= 1 && action.index <= list.length) {
+        next.assumptions = list.filter((_, i) => i !== action.index - 1);
+      }
+      break;
+    }
+    case 'rewriteAssumption': {
+      const list = next.assumptions ?? [];
+      if (action.index >= 1 && action.index <= list.length) {
+        next.assumptions = list.map((a, i) => (i === action.index - 1 ? { ...a, text: action.text } : a));
+      }
+      break;
+    }
+    case 'addOpenQuestion':
+      next.openQuestions = [
+        ...(next.openQuestions ?? []),
+        { id: uuid(), text: action.text, status: 'open', answer: '' },
+      ];
+      break;
+    case 'removeOpenQuestion': {
+      // The index from the LLM points into the OPEN-only list (that's what we
+      // showed it). Map back to the absolute index in openQuestions.
+      const openIdx = openIndexAt(next.openQuestions ?? [], action.index);
+      if (openIdx >= 0) {
+        next.openQuestions = (next.openQuestions ?? []).filter((_, i) => i !== openIdx);
+      }
+      break;
+    }
+    case 'answerOpenQuestion': {
+      const openIdx = openIndexAt(next.openQuestions ?? [], action.index);
+      if (openIdx >= 0) {
+        next.openQuestions = (next.openQuestions ?? []).map((q, i) =>
+          i === openIdx ? { ...q, status: 'answered' as const, answer: action.answer } : q,
+        );
+      }
+      break;
+    }
+    case 'addScopeItem':
+      if (action.kind === 'in') next.inScope = [...(next.inScope ?? []), action.text];
+      else next.outOfScope = [...(next.outOfScope ?? []), action.text];
+      break;
+    case 'removeScopeItem': {
+      const list = action.kind === 'in' ? (next.inScope ?? []) : (next.outOfScope ?? []);
+      if (action.index >= 1 && action.index <= list.length) {
+        const filtered = list.filter((_, i) => i !== action.index - 1);
+        if (action.kind === 'in') next.inScope = filtered;
+        else next.outOfScope = filtered;
+      }
+      break;
+    }
+  }
+
+  // Persist as new brief version — append-only, never destructive.
+  await execute('UPDATE briefs SET is_current = 0 WHERE project_id = ?', [req.params['id']]);
+  const existingCount = await queryOne<{ cnt: number }>('SELECT COUNT(*) as cnt FROM briefs WHERE project_id = ?', [req.params['id']]);
+  const version = (existingCount?.cnt ?? 0) + 1;
+  const shortLabel = `Chat: ${action.type}`;
+  await execute(
+    'INSERT INTO briefs (id, project_id, version, is_current, data, label, challenge_text) VALUES (?, ?, ?, 1, ?, ?, ?)',
+    [uuid(), req.params['id'], version, JSON.stringify(next), shortLabel, ''],
+  );
+
+  const versions = await query<BriefRow>('SELECT * FROM briefs WHERE project_id = ? ORDER BY version ASC', [req.params['id']]);
+  res.json({ reply, action, brief: { current: next, versions: toVersionHistory(versions) } });
 }));
 
-// POST /projects/:id/definition/chat — advisory chat about the project setup form.
+/** Maps a 1-based index into the OPEN-only subset of openQuestions back to
+ *  the absolute index in the original array. Returns -1 when out of range.
+ *  Status is widened to string since the project's question status enum
+ *  has more values than we care about here (open | answered | dismissed). */
+function openIndexAt(questions: Array<{ status: string }>, oneBasedOpenIndex: number): number {
+  let seen = 0;
+  for (let i = 0; i < questions.length; i++) {
+    if (questions[i]?.status !== 'open') continue;
+    seen++;
+    if (seen === oneBasedOpenIndex) return i;
+  }
+  return -1;
+}
+
+// POST /projects/:id/definition/chat — answers questions about the project
+// setup form OR updates a single allowed field on the project row.
+// Field-to-column mapping below; anything else is blocked at the validator
+// level inside chatAboutDefinition.
+const DEFINITION_FIELD_TO_COLUMN: Record<string, string> = {
+  name: 'name',
+  client: 'client',
+  projectType: 'project_type',
+  estimatedBudget: 'estimated_budget',
+  startDate: 'start_date',
+  contactPerson: 'contact_person',
+  rawInput: 'raw_input',
+};
+
 projectsRouter.post('/:id/definition/chat', asyncHandler(async (req, res) => {
   const project = req.project as unknown as ProjectRow;
   const body = req.body as { message?: string; history?: { role: 'user' | 'agent'; text: string }[] };
   const message = (body.message ?? '').trim();
   if (!message) { res.status(400).json({ error: 'message is required.' }); return; }
   const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
-  let result;
+
+  let chatResult;
   try {
-    result = await chatAboutDefinition(
+    chatResult = await chatAboutDefinition(
       project.provider as 'anthropic' | 'openai',
       {
         name: project.name ?? '',
@@ -1055,10 +1293,29 @@ projectsRouter.post('/:id/definition/chat', asyncHandler(async (req, res) => {
       history,
     );
   } catch (err) { throw llmErrorToHttp(err); }
-  res.json(result);
+
+  const { reply, action } = chatResult;
+
+  if (action.type === 'updateField') {
+    const column = DEFINITION_FIELD_TO_COLUMN[action.field];
+    if (column) {
+      // Direct, narrow UPDATE — the column name is allowlisted above so we
+      // cannot inject anything via the LLM-supplied field name.
+      await execute(`UPDATE projects SET ${column} = ?, updated_at = NOW() WHERE id = ?`, [action.value, req.params['id']]);
+    }
+    const updated = await queryOne<ProjectRow>('SELECT * FROM projects WHERE id = ?', [req.params['id']]);
+    res.json({ reply, action, project: updated });
+    return;
+  }
+
+  res.json({ reply, action });
 }));
 
-// POST /projects/:id/sync/chat — advisory chat about ClickUp sync state.
+// POST /projects/:id/sync/chat — answers questions about sync state OR
+// returns an action ('triggerSync' | 'resetSync') for the frontend to
+// execute against its existing sync store actions. The chat endpoint
+// never actually pushes to ClickUp itself — that's still owned by the
+// dedicated /sync route + the client-side startSync flow.
 projectsRouter.post('/:id/sync/chat', asyncHandler(async (req, res) => {
   const project = req.project as unknown as ProjectRow;
   const body = req.body as { message?: string; history?: { role: 'user' | 'agent'; text: string }[] };
@@ -1074,9 +1331,9 @@ projectsRouter.post('/:id/sync/chat', asyncHandler(async (req, res) => {
   const syncedKeys = new Set(mappingRows.map((m) => m.entity_key));
   const syncedCount = taskRows.filter((t) => syncedKeys.has(t.task_key)).length;
 
-  let result;
+  let chatResult;
   try {
-    result = await chatAboutSync(
+    chatResult = await chatAboutSync(
       project.provider as 'anthropic' | 'openai',
       {
         projectName: project.name ?? '(untitled)',
@@ -1089,7 +1346,8 @@ projectsRouter.post('/:id/sync/chat', asyncHandler(async (req, res) => {
       history,
     );
   } catch (err) { throw llmErrorToHttp(err); }
-  res.json(result);
+
+  res.json({ reply: chatResult.reply, action: chatResult.action });
 }));
 
 // POST /projects/:id/epics/chat — conversational reply about epics, no DB writes
@@ -1109,9 +1367,14 @@ projectsRouter.post('/:id/epics/chat', asyncHandler(async (req, res) => {
   const epics = epicRows.map((r) => safeJsonParse<Epic>(r.data, {} as Epic));
   const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
 
+  // Pull the most recent regen event so the chat can answer "what changed?"
+  // questions referencing the previous list. Null when no recent regen exists.
+  const recentRegen = await getMostRecentRegenEvent(req.params['id'] as string, 'epics');
+  const regenContext = formatRegenContextForChat(recentRegen, 'epic');
+
   let result;
   try {
-    result = await chatAboutEpics(project.provider as 'anthropic' | 'openai', brief, epics, message, history);
+    result = await chatAboutEpics(project.provider as 'anthropic' | 'openai', brief, epics, message, history, regenContext);
   } catch (err) {
     throw llmErrorToHttp(err);
   }
@@ -1247,9 +1510,12 @@ projectsRouter.post('/:id/journeys/chat', asyncHandler(async (req, res) => {
   const journeys = journeyRows.map((r) => safeJsonParse<Journey>(r.data, {} as Journey));
   const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
 
+  const recentRegen = await getMostRecentRegenEvent(req.params['id'] as string, 'journeys');
+  const regenContext = formatRegenContextForChat(recentRegen, 'journey');
+
   let result;
   try {
-    result = await chatAboutJourneys(project.provider as 'anthropic' | 'openai', brief, epics, journeys, message, history);
+    result = await chatAboutJourneys(project.provider as 'anthropic' | 'openai', brief, epics, journeys, message, history, regenContext);
   } catch (err) {
     throw llmErrorToHttp(err);
   }
@@ -1328,6 +1594,15 @@ projectsRouter.post('/:id/journeys/generate', asyncHandler(async (req, res) => {
   const challengeText = (req.body as { challengeText?: string }).challengeText ?? '';
   const provider = project.provider as 'anthropic' | 'openai';
 
+  // Snapshot the BEFORE state so we can record a regen diff for chat context.
+  const beforeJourneyRows = await query<JourneyRow>(
+    'SELECT data FROM journeys WHERE project_id = ? AND is_current = 1',
+    [req.params['id']],
+  );
+  const beforeJourneys = beforeJourneyRows
+    .map((r) => safeJsonParse<Journey>(r.data, {} as Journey))
+    .filter((j) => j && j.title);
+
   // Deactivate the existing journeys UPFRONT so the polling endpoint returns
   // an empty list during the LLM call — the user sees journeys appear from a
   // clean slate rather than seeing old data swap with new data at the end.
@@ -1374,6 +1649,18 @@ projectsRouter.post('/:id/journeys/generate', asyncHandler(async (req, res) => {
   }
 
   await execute('UPDATE projects SET updated_at = NOW() WHERE id = ?', [req.params['id']]);
+
+  // Log this regen so the chat module can answer "what changed?".
+  const afterJourneys = savedRows
+    .map((r) => safeJsonParse<Journey>(r.data, {} as Journey))
+    .filter((j) => j && j.title);
+  await recordRegenEvent(
+    req.params['id'] as string,
+    'journeys',
+    beforeJourneys.map((j) => ({ title: j.title })),
+    afterJourneys.map((j) => ({ title: j.title })),
+    challengeText,
+  );
 
   res.json(savedRows.map((r) => ({
     current: typeof r.data === 'string' ? JSON.parse(r.data) : r.data,
@@ -1525,9 +1812,12 @@ projectsRouter.post('/:id/tasks/chat', asyncHandler(async (req, res) => {
   const tasks = taskRows.map((r) => safeJsonParse<Record<string, unknown>>(r.data, {} as Record<string, unknown>));
   const history = Array.isArray(body.history) ? body.history.slice(-8) : [];
 
+  const recentRegen = await getMostRecentRegenEvent(req.params['id'] as string, 'tasks');
+  const regenContext = formatRegenContextForChat(recentRegen, 'task');
+
   let result;
   try {
-    result = await chatAboutTasks(project.provider as 'anthropic' | 'openai', brief, epics, journeys, tasks, message, history);
+    result = await chatAboutTasks(project.provider as 'anthropic' | 'openai', brief, epics, journeys, tasks, message, history, regenContext);
   } catch (err) {
     throw llmErrorToHttp(err);
   }
@@ -1611,16 +1901,32 @@ projectsRouter.post('/:id/tasks/generate', asyncHandler(async (req, res) => {
   const { systemPrompt, userTemplate } = await getPromptConfig('task_decomposition', req.user!.orgId, promptType(project.project_type));
   const challengeText = (req.body as { challengeText?: string }).challengeText ?? '';
 
+  // Snapshot the BEFORE state so we can record a regen diff for chat context.
+  const beforeTaskRows = await query<TaskRow>(
+    'SELECT data FROM tasks WHERE project_id = ? AND is_current = 1',
+    [req.params['id']],
+  );
+  const beforeTasks = beforeTaskRows
+    .map((r) => safeJsonParse<Record<string, unknown>>(r.data, {}))
+    .filter((t) => typeof t['title'] === 'string');
+
   await execute('UPDATE tasks SET is_current = 0 WHERE project_id = ?', [req.params['id']]);
 
-  // Generate tasks per-journey with bounded concurrency. Sequential generation
-  // for 15+ journeys takes 75-150s and was silently dropping failures. We run
-  // 2 in parallel — high enough to keep wall time reasonable, low enough that
-  // OpenAI's lower tier (T1) doesn't 429 mid-batch. Retry/backoff for transient
-  // 429s/5xx is handled inside callLLM. Hard quota errors bubble up as
-  // "quota exceeded" so the user can switch provider.
+  // Generate tasks per-journey with bounded concurrency. For 15+ journeys
+  // serial generation was 75–150s; at the default concurrency below it's
+  // ~3–4x faster. Defaults assume a standard API tier (OpenAI T2+, Anthropic
+  // normal) — both handle this load without rate-limit issues, and callLLM
+  // already retries any transient 429/5xx with exponential backoff.
+  //
+  // If you're on OpenAI T1 (very low TPM cap) and seeing rate-limit errors,
+  // lower these via env: TASK_GEN_CONCURRENCY_OPENAI=2 or
+  // TASK_GEN_CONCURRENCY_ANTHROPIC=3.
   const provider = project.provider as 'anthropic' | 'openai';
-  const CONCURRENCY = provider === 'openai' ? 2 : 3;
+  const defaultConcurrency = provider === 'openai' ? 5 : 8;
+  const envKey = provider === 'openai' ? 'TASK_GEN_CONCURRENCY_OPENAI' : 'TASK_GEN_CONCURRENCY_ANTHROPIC';
+  const envOverride = parseInt(process.env[envKey] ?? '', 10);
+  const CONCURRENCY = Number.isFinite(envOverride) && envOverride > 0 ? envOverride : defaultConcurrency;
+  console.log(`[tasks/generate] starting — ${journeyRows.length} journeys, concurrency=${CONCURRENCY}, provider=${provider}`);
 
   type JourneyOutcome = { journey: Journey; tasks: import('../ai/index.js').Task[] | null; error: string | null };
 
@@ -1629,35 +1935,46 @@ projectsRouter.post('/:id/tasks/generate', asyncHandler(async (req, res) => {
     if (!epic) {
       return { journey, tasks: null, error: `parent epic missing for journey ${journey.id ?? journey.title}` };
     }
-    let lastErr: unknown;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        // startIndex=0 here; we re-number wbsIds globally after all results come back
-        const tasks = await generateTasks(journey, epic, provider, systemPrompt, userTemplate, 0, challengeText);
-        return { journey, tasks, error: null };
-      } catch (err) {
-        lastErr = err;
-        // Don't retry on JSON-parse / validation errors — they're deterministic
-        // (the model gave bad output, retrying gets the same bad output) and
-        // double the wall-clock time. Only retry on network/timeout errors.
-        const msg = err instanceof Error ? err.message : String(err);
-        if (/JSON|parse|invalid|schema|too small/i.test(msg)) break;
-      }
+    // No outer retry — callLLM already does exponential-backoff retry (1.5s +
+    // 4s + 9s) for transient 429/5xx errors. The previous outer 2-attempt
+    // loop was double-retrying, doubling worst-case latency for no quality
+    // win (deterministic errors like bad JSON repeat anyway).
+    const startMs = Date.now();
+    try {
+      const tasks = await generateTasks(journey, epic, provider, systemPrompt, userTemplate, 0, challengeText);
+      const elapsed = Date.now() - startMs;
+      console.log(`[tasks/generate] journey "${(journey.title ?? '').slice(0, 40)}" → ${tasks.length} tasks in ${elapsed}ms`);
+      return { journey, tasks, error: null };
+    } catch (err) {
+      const elapsed = Date.now() - startMs;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[tasks/generate] journey "${(journey.title ?? '').slice(0, 40)}" FAILED after ${elapsed}ms: ${msg.slice(0, 120)}`);
+      return { journey, tasks: null, error: msg };
     }
-    return { journey, tasks: null, error: lastErr instanceof Error ? lastErr.message : String(lastErr) };
   }
 
   const journeys = journeyRows.map((row) => safeJsonParse<Journey>(row.data, {} as Journey));
-  const outcomes: JourneyOutcome[] = [];
+  // Indexed by journey position so the final wbs-renumber loop reads them in
+  // journey order even though workers complete in completion order.
+  const outcomesByIndex: (JourneyOutcome | undefined)[] = new Array(journeys.length);
+  const totalStartMs = Date.now();
 
-  for (let i = 0; i < journeys.length; i += CONCURRENCY) {
-    const batch = journeys.slice(i, i + CONCURRENCY);
-    const batchResults = await Promise.all(batch.map((j) => generateForJourney(j)));
+  // Worker-pool concurrency. The old "batches of N then Promise.all + next
+  // batch" pattern stalled the whole batch on its slowest journey. A worker
+  // pool keeps CONCURRENCY workers continuously busy — as soon as one
+  // journey finishes, that worker picks up the next available journey
+  // immediately. On a project where some journeys are 5s and some are 30s
+  // this gives a roughly 2-3x speedup on top of the higher concurrency.
+  let cursor = 0;
+  async function worker(): Promise<void> {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= journeys.length) return;
+      const journey = journeys[idx]!;
+      const outcome = await generateForJourney(journey);
+      outcomesByIndex[idx] = outcome;
 
-    // Insert this batch's tasks into the DB BEFORE starting the next batch so
-    // the frontend polling sees tasks streaming in instead of one big drop at
-    // the end. WBS numbering is finalized after all batches complete.
-    for (const outcome of batchResults) {
+      // Insert immediately so frontend polling sees tasks streaming in.
       if (outcome.tasks) {
         for (const task of outcome.tasks) {
           await execute(
@@ -1667,8 +1984,10 @@ projectsRouter.post('/:id/tasks/generate', asyncHandler(async (req, res) => {
         }
       }
     }
-    outcomes.push(...batchResults);
   }
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, journeys.length) }, () => worker()));
+  const outcomes: JourneyOutcome[] = outcomesByIndex.filter((o): o is JourneyOutcome => o != null);
+  console.log(`[tasks/generate] all journeys done in ${Date.now() - totalStartMs}ms`);
 
   // Finalize WBS numbering across all generated tasks (deterministic order =
   // journey order, then task order within journey).
@@ -1700,6 +2019,19 @@ projectsRouter.post('/:id/tasks/generate', asyncHandler(async (req, res) => {
   if (failures.length > 0) {
     console.warn('[tasks/generate] partial failures:', failures);
   }
+
+  // Log this regen so the chat module can answer "what changed?".
+  const afterTaskTitles = allResults
+    .map((r) => (r.current as { title?: string }).title)
+    .filter((t): t is string => typeof t === 'string');
+  await recordRegenEvent(
+    req.params['id'] as string,
+    'tasks',
+    beforeTasks.map((t) => ({ title: t['title'] as string })),
+    afterTaskTitles.map((title) => ({ title })),
+    challengeText,
+  );
+
   res.json({ tasks: allResults, failures });
 }));
 

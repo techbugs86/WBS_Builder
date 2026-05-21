@@ -17,6 +17,11 @@ interface EpicRow {
   data: string;
 }
 
+interface JourneyRow {
+  journey_key: string;
+  data: string;
+}
+
 interface TaskRow {
   task_key: string;
   data: string;
@@ -29,7 +34,8 @@ interface TaskData {
   estimateHours: number;
   domain: string;
   epicId: string;
-  acceptanceCriteria: Array<{ type: string; given: string; when: string; then: string }>;
+  journeyId: string;
+  acceptanceCriteria: Array<{ type: 'functional' | 'non-functional' | 'technical'; given: string; when: string; then: string }>;
   status: string;
 }
 
@@ -38,6 +44,17 @@ interface EpicData {
   title: string;
   description: string;
   domain: string;
+  storyPoints?: number;
+}
+
+interface JourneyData {
+  id: string;
+  epicId: string;
+  title: string;
+  persona: string;
+  happyPath: string;
+  steps: string[];
+  edgeCases: string[];
 }
 
 export interface SyncLogEntry {
@@ -71,19 +88,102 @@ async function setMapping(projectId: string, type: 'folder' | 'list' | 'task', k
   );
 }
 
-function taskDescription(task: TaskData): string {
-  const acLines = task.acceptanceCriteria
-    .map((ac, i) => `${i + 1}. **[${ac.type}]** Given ${ac.given}\n   When ${ac.when}\n   Then ${ac.then}`)
-    .join('\n\n');
+// ─── Description formatters ──────────────────────────────────────────────────
+//
+// Plain-markdown descriptions for ClickUp. ClickUp renders **bold**, ## H2,
+// numbered/bulleted lists, and code fences in task descriptions out of the box.
+// Keep these formatters dumb (no LLM calls) so sync stays deterministic.
+
+function epicDescription(epic: EpicData): string {
   return [
+    `**Domain:** ${epic.domain}`,
+    epic.storyPoints !== undefined ? `**Story points:** ${epic.storyPoints}` : '',
+    '',
+    epic.description || '_No description._',
+  ].filter(Boolean).join('\n');
+}
+
+function journeyDescription(journey: JourneyData): string {
+  const stepLines = (journey.steps ?? []).map((s, i) => `${i + 1}. ${s}`).join('\n');
+  const edgeLines = (journey.edgeCases ?? []).map((e, i) => `${i + 1}. ${e}`).join('\n');
+  return [
+    `**Persona:** ${journey.persona || '_unspecified_'}`,
+    '',
+    '## Happy Path',
+    journey.happyPath || '_None._',
+    '',
+    '## Steps',
+    stepLines || '_None._',
+    '',
+    '## Edge Cases',
+    edgeLines || '_None._',
+  ].join('\n');
+}
+
+/**
+ * Task description with AC grouped by FR / NFR / Technical sections, so the
+ * dev reading the ClickUp task sees the requirements organized by type
+ * (matching the PM's mental model from the Tasks page in the app).
+ */
+function taskDescription(task: TaskData): string {
+  const byType = {
+    functional: task.acceptanceCriteria.filter((ac) => ac.type === 'functional'),
+    'non-functional': task.acceptanceCriteria.filter((ac) => ac.type === 'non-functional'),
+    technical: task.acceptanceCriteria.filter((ac) => ac.type === 'technical'),
+  };
+  const renderAC = (group: Array<{ given: string; when: string; then: string }>): string =>
+    group.map((ac, i) => `${i + 1}. **Given** ${ac.given}\n   **When** ${ac.when}\n   **Then** ${ac.then}`).join('\n\n');
+
+  const sections: string[] = [
     `**WBS ID:** \`${task.wbsId}\``,
     `**Domain:** ${task.domain}`,
     `**Estimate:** ${task.estimateHours}h`,
     '',
-    '## Acceptance Criteria',
-    acLines || '_None defined._',
-  ].join('\n');
+  ];
+  if (byType.functional.length > 0) {
+    sections.push('## Functional Requirements (FR)', renderAC(byType.functional), '');
+  }
+  if (byType['non-functional'].length > 0) {
+    sections.push('## Non-Functional Requirements (NFR)', renderAC(byType['non-functional']), '');
+  }
+  if (byType.technical.length > 0) {
+    sections.push('## Technical Constraints', renderAC(byType.technical), '');
+  }
+  if (byType.functional.length + byType['non-functional'].length + byType.technical.length === 0) {
+    sections.push('_No acceptance criteria defined._');
+  }
+  return sections.join('\n').trim();
 }
+
+// ─── Destructive cleanup ─────────────────────────────────────────────────────
+//
+// "Start over" mode: delete the existing ClickUp folder for this project
+// (which cascades through lists, tasks, and subtasks), then wipe all
+// mappings so the rebuild below starts from a clean slate. This is the
+// path chosen when the user re-syncs with a new hierarchy shape.
+
+async function destructiveCleanup(
+  projectId: string,
+  apiKey: string,
+  log: SyncLogEntry[],
+): Promise<void> {
+  const folderId = await getMapping(projectId, 'folder', projectId);
+  if (folderId) {
+    log.push({ timestamp: ts(), message: `↻ Cleanup: deleting existing ClickUp folder ${folderId} and all nested lists/tasks/subtasks…`, type: 'info' });
+    const res = await clickupRequest(`/folder/${folderId}`, { method: 'DELETE', projectId, apiKey });
+    if (res.ok || res.status === 404) {
+      log.push({ timestamp: ts(), message: `✓ Cleanup: existing folder removed.`, type: 'success' });
+    } else {
+      log.push({ timestamp: ts(), message: `⚠ Cleanup: folder delete returned ${res.status} (${res.error ?? 'no message'}). Continuing — old items may linger; delete them manually in ClickUp UI.`, type: 'error' });
+    }
+  } else {
+    log.push({ timestamp: ts(), message: `Cleanup: no existing folder mapping — fresh project.`, type: 'info' });
+  }
+  // Wipe ALL mappings for this project so the rebuild creates fresh IDs.
+  await execute('DELETE FROM clickup_mappings WHERE project_id = ?', [projectId]);
+}
+
+// ─── Main sync ───────────────────────────────────────────────────────────────
 
 export async function syncProjectToClickUp(
   project: ProjectRow,
@@ -96,9 +196,13 @@ export async function syncProjectToClickUp(
 
   log.push({ timestamp: ts(), message: `Starting ClickUp sync for "${project.name}"…`, type: 'info' });
 
-  // ─── Load epics + approved tasks ────────────────────────────────────────
+  // ─── Load epics, journeys, approved tasks ───────────────────────────────
   const epicRows = await query<EpicRow>(
     'SELECT epic_key, data FROM epics WHERE project_id = ? AND is_current = 1',
+    [project.id],
+  );
+  const journeyRows = await query<JourneyRow>(
+    'SELECT journey_key, data FROM journeys WHERE project_id = ? AND is_current = 1',
     [project.id],
   );
   const taskRows = await query<TaskRow>(
@@ -112,340 +216,189 @@ export async function syncProjectToClickUp(
     return { log, syncedCount: 0, errorCount: 0 };
   }
 
-  const tasks: Array<{ taskKey: string; task: TaskData }> = taskRows.map((r) => ({
+  const epics = epicRows.map((r) => ({
+    epicKey: r.epic_key,
+    epic: (typeof r.data === 'string' ? JSON.parse(r.data) : r.data) as EpicData,
+  }));
+  const journeys = journeyRows.map((r) => ({
+    journeyKey: r.journey_key,
+    journey: (typeof r.data === 'string' ? JSON.parse(r.data) : r.data) as JourneyData,
+  }));
+  const tasks = taskRows.map((r) => ({
     taskKey: r.task_key,
     task: (typeof r.data === 'string' ? JSON.parse(r.data) : r.data) as TaskData,
   }));
 
-  // ─── Pre-check: which approved tasks are NOT yet synced? ────────────────
-  // Skip already-synced tasks unless the user explicitly wants to re-update.
-  const unsynced: Array<{ taskKey: string; task: TaskData }> = [];
-  let alreadySyncedCount = 0;
-  for (const item of tasks) {
-    const existing = await getMapping(project.id, 'task', item.taskKey);
-    if (existing) {
-      alreadySyncedCount++;
-    } else {
-      unsynced.push(item);
-    }
+  // ─── Determine which epics + journeys to create ─────────────────────────
+  // Only sync items that have downstream approved content. Skip empty epics
+  // and journeys so the ClickUp folder doesn't fill up with shells.
+  const taskByJourneyId = new Map<string, typeof tasks>();
+  for (const t of tasks) {
+    const arr = taskByJourneyId.get(t.task.journeyId) ?? [];
+    arr.push(t);
+    taskByJourneyId.set(t.task.journeyId, arr);
+  }
+  const journeysWithApprovedTasks = journeys.filter((j) => (taskByJourneyId.get(j.journey.id)?.length ?? 0) > 0);
+  const journeysByEpicId = new Map<string, typeof journeys>();
+  for (const j of journeysWithApprovedTasks) {
+    const arr = journeysByEpicId.get(j.journey.epicId) ?? [];
+    arr.push(j);
+    journeysByEpicId.set(j.journey.epicId, arr);
+  }
+  const epicsToCreate = epics.filter((e) => (journeysByEpicId.get(e.epic.id)?.length ?? 0) > 0);
+
+  if (epicsToCreate.length === 0) {
+    log.push({ timestamp: ts(), message: `Approved tasks exist but none have a matching epic+journey. Regenerate the pipeline and re-sync.`, type: 'error' });
+    return { log, syncedCount: 0, errorCount: 1 };
   }
 
-  // Early exit: everything already synced → no API calls needed.
-  if (unsynced.length === 0) {
-    log.push({
-      timestamp: ts(),
-      message: `✓ All ${tasks.length} approved task(s) are already synced. Nothing to do.`,
-      type: 'success',
-    });
-    return { log, syncedCount: 0, errorCount: 0 };
-  }
+  // ─── Destructive cleanup (chosen path: "start over") ────────────────────
+  log.push({ timestamp: ts(), message: `⚠ DESTRUCTIVE MODE: existing ClickUp folder + all nested content will be replaced. Manual ClickUp edits will be lost.`, type: 'info' });
+  await destructiveCleanup(project.id, apiKey, log);
 
-  if (alreadySyncedCount > 0) {
-    log.push({
-      timestamp: ts(),
-      message: `${alreadySyncedCount} task(s) already synced — skipping. Syncing ${unsynced.length} new task(s).`,
-      type: 'info',
-    });
-  }
-
-  // ─── 1. Folder (project) ────────────────────────────────────────────────
+  // ─── Create fresh folder ────────────────────────────────────────────────
   const folderName = `${project.name}${project.client ? ` — ${project.client}` : ''}`;
-  let folderId = await getMapping(project.id, 'folder', project.id);
-
-  // Validate the cached folder mapping is still alive in ClickUp. If the user
-  // archived/trashed the folder in the ClickUp UI, our cached ID points to a
-  // ghost — list-creates inside it appear to succeed (ClickUp doesn't validate)
-  // but task-creates fail with "List deleted." Catch this up front and fall
-  // through to adopt-by-name / fresh-create instead of marching into the wall.
-  if (folderId) {
-    const check = await clickupRequest<{ id: string; archived?: boolean }>(
-      `/folder/${folderId}`,
-      { method: 'GET', projectId: project.id, apiKey },
-    );
-    const isMissing = !check.ok || check.status === 404;
-    const isArchived = check.ok && check.data?.archived === true;
-    if (isMissing || isArchived) {
-      log.push({
-        timestamp: ts(),
-        message: `↻ Cached folder ${folderId} is ${isArchived ? 'archived' : 'missing'} in ClickUp — clearing stale mappings and re-creating.`,
-        type: 'info',
-      });
-      // Wipe our stale folder + list mappings for this project so the next
-      // steps create fresh ones. Task mappings remain so we don't re-push
-      // tasks that were already created in OTHER folders (unlikely but safe).
-      await execute('DELETE FROM clickup_mappings WHERE project_id = ? AND entity_type IN (\'folder\', \'list\')', [project.id]);
-      folderId = null;
-    }
-  }
-
-  // Adopt-by-name: if our mapping is missing (e.g. project deleted+recreated, or
-  // first sync after tests cleared the DB) but ClickUp still has a folder with
-  // this exact name, reuse it. Avoids the "Folder name taken" 400 from POST.
-  if (!folderId) {
-    const foldersRes = await clickupRequest<{ folders: Array<{ id: string; name: string }> }>(
-      `/space/${spaceId}/folder`,
-      { method: 'GET', projectId: project.id, apiKey },
-    );
-    if (foldersRes.ok && Array.isArray(foldersRes.data?.folders)) {
-      const existing = foldersRes.data!.folders.find((f) => f.name === folderName);
-      if (existing) {
-        folderId = existing.id;
-        await setMapping(project.id, 'folder', project.id, folderId);
-        log.push({ timestamp: ts(), message: `↻ Adopted existing folder "${folderName}" (${folderId})`, type: 'info' });
-      }
-    }
-  }
-
-  if (!folderId) {
-    log.push({ timestamp: ts(), message: `Creating folder for project…`, type: 'info' });
+  let folderId: string;
+  {
     const res = await clickupRequest<{ id: string }>(`/space/${spaceId}/folder`, {
       method: 'POST',
       body: { name: folderName },
       projectId: project.id,
       apiKey,
     });
-
-    // Race-condition fallback: another sync (or our own pre-fetch missing it
-    // due to eventual consistency) created the folder between the GET and POST.
-    if ((!res.ok || !res.data?.id) && res.error && /name taken/i.test(res.error)) {
-      const retry = await clickupRequest<{ folders: Array<{ id: string; name: string }> }>(
+    if (res.ok && res.data?.id) {
+      folderId = res.data.id;
+      await setMapping(project.id, 'folder', project.id, folderId);
+      log.push({ timestamp: ts(), message: `✓ Created folder "${folderName}" (${folderId})`, type: 'success' });
+    } else if (res.error && /name taken/i.test(res.error)) {
+      // Cleanup didn't delete the folder (e.g. permission issue) but its
+      // name is still taken. Adopt by name so we proceed instead of erroring.
+      const list = await clickupRequest<{ folders: Array<{ id: string; name: string }> }>(
         `/space/${spaceId}/folder`,
         { method: 'GET', projectId: project.id, apiKey },
       );
-      const found = retry.data?.folders?.find((f) => f.name === folderName);
+      const found = list.data?.folders?.find((f) => f.name === folderName);
       if (found?.id) {
         folderId = found.id;
         await setMapping(project.id, 'folder', project.id, folderId);
-        log.push({ timestamp: ts(), message: `↻ Adopted existing folder "${folderName}" after name conflict (${folderId})`, type: 'info' });
-      }
-    }
-
-    if (!folderId) {
-      if (res.ok && res.data?.id) {
-        folderId = res.data.id;
-        await setMapping(project.id, 'folder', project.id, folderId);
-        log.push({ timestamp: ts(), message: `✓ Created folder (${folderId})`, type: 'success' });
+        log.push({ timestamp: ts(), message: `↻ Adopted existing folder "${folderName}" (${folderId}). You may want to manually delete its old contents.`, type: 'info' });
       } else {
         log.push({ timestamp: ts(), message: `✗ Failed to create folder: ${res.error}`, type: 'error' });
         return { log, syncedCount: 0, errorCount: 1 };
       }
+    } else {
+      log.push({ timestamp: ts(), message: `✗ Failed to create folder: ${res.error ?? 'unknown error'}`, type: 'error' });
+      return { log, syncedCount: 0, errorCount: 1 };
     }
-  } else {
-    log.push({ timestamp: ts(), message: `Reusing existing folder (${folderId})`, type: 'info' });
   }
 
-  // ─── 2. Build epic lookup ───────────────────────────────────────────────
-  const epicByEpicId = new Map<string, EpicData & { epicKey: string }>();
-  for (const row of epicRows) {
-    const epic = (typeof row.data === 'string' ? JSON.parse(row.data) : row.data) as EpicData;
-    epicByEpicId.set(epic.id, { ...epic, epicKey: row.epic_key });
-  }
-
-  // Only consider epics that have at least one *unsynced* task — no need to
-  // create a list for an epic whose tasks are all already in ClickUp.
-  const usedEpicIds = new Set(unsynced.map((t) => t.task.epicId));
-  const listIdByEpicId = new Map<string, string>();
-
-  const orphanEpicIds = [...usedEpicIds].filter((id) => !epicByEpicId.has(id));
-  if (orphanEpicIds.length > 0) {
-    log.push({
-      timestamp: ts(),
-      message: `⚠ ${orphanEpicIds.length} unsynced task(s) reference epic IDs that no longer exist. This usually happens when epics or journeys were regenerated AFTER tasks were created. Fix: regenerate Journeys → regenerate Tasks → approve them again → re-sync.`,
-      type: 'error',
-    });
-  }
-
-  // Fetch all existing lists in this folder — both live and archived — so we
-  // can:
-  //   1. Validate cached list mappings against what's actually live.
-  //   2. Adopt-by-name when the title matches an existing live list.
-  //   3. UNARCHIVE a trashed list when the user wants to re-sync — ClickUp's
-  //      "name taken" check spans live + archived, so we MUST recover archived
-  //      lists rather than try to create new ones with the same title.
-  const existingListsByName = new Map<string, string>();
-  const archivedListsByName = new Map<string, string>();
-  const liveListIds = new Set<string>();
+  // ─── Create one default list inside the folder ──────────────────────────
+  // All epics live as parent tasks inside this list. Subtasks (journeys) and
+  // sub-subtasks (tasks) are nested under their epic.
+  const listName = 'Pipeline';
+  let listId: string;
   {
-    const listsRes = await clickupRequest<{ lists: Array<{ id: string; name: string; archived?: boolean }> }>(
-      `/folder/${folderId}/list`,
-      { method: 'GET', projectId: project.id, apiKey },
-    );
-    if (listsRes.ok && Array.isArray(listsRes.data?.lists)) {
-      for (const l of listsRes.data!.lists) {
-        if (l.archived) continue;
-        existingListsByName.set(l.name, l.id);
-        liveListIds.add(l.id);
-      }
-    }
-    // Separate fetch for archived lists. ClickUp's default GET excludes them.
-    const archivedRes = await clickupRequest<{ lists: Array<{ id: string; name: string }> }>(
-      `/folder/${folderId}/list?archived=true`,
-      { method: 'GET', projectId: project.id, apiKey },
-    );
-    if (archivedRes.ok && Array.isArray(archivedRes.data?.lists)) {
-      for (const l of archivedRes.data!.lists) {
-        archivedListsByName.set(l.name, l.id);
-      }
-    }
-  }
-
-  async function unarchiveList(listId: string): Promise<boolean> {
-    const res = await clickupRequest<{ id: string }>(`/list/${listId}`, {
-      method: 'PUT',
-      body: { archived: false },
+    const res = await clickupRequest<{ id: string }>(`/folder/${folderId}/list`, {
+      method: 'POST',
+      body: { name: listName },
       projectId: project.id,
       apiKey,
     });
-    return res.ok;
-  }
-
-  // Pre-flight: prune any cached list mappings that point to dead lists.
-  // Without this, the sync trusts the stale ID, "Reuses" the list, and every
-  // task-create then 400s with "List deleted." Wipe the bad rows so the
-  // adopt-by-name / fresh-create path below can recover automatically.
-  const cachedListRows = await query<{ entity_key: string; clickup_id: string }>(
-    'SELECT entity_key, clickup_id FROM clickup_mappings WHERE project_id = ? AND entity_type = \'list\'',
-    [project.id],
-  );
-  let prunedCount = 0;
-  for (const row of cachedListRows) {
-    if (!liveListIds.has(row.clickup_id)) {
-      await execute(
-        'DELETE FROM clickup_mappings WHERE project_id = ? AND entity_type = \'list\' AND entity_key = ?',
-        [project.id, row.entity_key],
-      );
-      prunedCount++;
+    if (!res.ok || !res.data?.id) {
+      log.push({ timestamp: ts(), message: `✗ Failed to create list "${listName}": ${res.error}`, type: 'error' });
+      return { log, syncedCount, errorCount: errorCount + 1 };
     }
-  }
-  if (prunedCount > 0) {
-    log.push({
-      timestamp: ts(),
-      message: `↻ Pruned ${prunedCount} stale list mapping(s) — their ClickUp lists were deleted/archived. Will recreate.`,
-      type: 'info',
-    });
+    listId = res.data.id;
+    await setMapping(project.id, 'list', project.id, listId);
+    log.push({ timestamp: ts(), message: `✓ Created list "${listName}" (${listId})`, type: 'success' });
   }
 
-  for (const epicId of usedEpicIds) {
-    const epic = epicByEpicId.get(epicId);
-    if (!epic) {
-      log.push({ timestamp: ts(), message: `⚠ Skipping orphan tasks for missing epic ${epicId}`, type: 'error' });
+  // ─── Create Epic → Journey → Task hierarchy ─────────────────────────────
+  for (const { epicKey, epic } of epicsToCreate) {
+    // 1. Epic as a parent task in the Pipeline list
+    const epicRes = await clickupRequest<{ id: string }>(`/list/${listId}/task`, {
+      method: 'POST',
+      body: {
+        name: epic.title,
+        description: epicDescription(epic),
+        tags: [epic.domain, 'epic'],
+      },
+      projectId: project.id,
+      apiKey,
+    });
+    if (!epicRes.ok || !epicRes.data?.id) {
+      log.push({ timestamp: ts(), message: `✗ Failed to create epic "${epic.title}": ${epicRes.error}`, type: 'error' });
+      errorCount++;
       continue;
     }
-    let listId = await getMapping(project.id, 'list', epic.epicKey);
+    const epicTaskId = epicRes.data.id;
+    await setMapping(project.id, 'task', epicKey, epicTaskId);
+    log.push({ timestamp: ts(), message: `✓ Epic: ${epic.title}`, type: 'success' });
 
-    // Adopt-by-name: if our mapping is gone but ClickUp still has a list with
-    // this exact title, reuse its ID and save a fresh mapping. This is what
-    // the user expects after a bulk-delete + regenerate cycle.
-    if (!listId && existingListsByName.has(epic.title)) {
-      listId = existingListsByName.get(epic.title)!;
-      await setMapping(project.id, 'list', epic.epicKey, listId);
-      log.push({ timestamp: ts(), message: `↻ Adopted existing list "${epic.title}" (${listId})`, type: 'info' });
-    }
-
-    // Restore-from-archive: ClickUp's "name taken" check spans archived lists,
-    // so trying to POST a new list with the same name will fail. Instead, find
-    // the archived list by name and unarchive it. Mirrors how a user would
-    // restore from the ClickUp trash UI.
-    if (!listId && archivedListsByName.has(epic.title)) {
-      const archivedId = archivedListsByName.get(epic.title)!;
-      const restored = await unarchiveList(archivedId);
-      if (restored) {
-        listId = archivedId;
-        await setMapping(project.id, 'list', epic.epicKey, listId);
-        log.push({ timestamp: ts(), message: `↻ Restored archived list "${epic.title}" (${listId})`, type: 'info' });
-      }
-    }
-
-    if (!listId) {
-      const res = await clickupRequest<{ id: string }>(`/folder/${folderId}/list`, {
+    // 2. Journeys for this epic — subtasks under epicTaskId
+    const epicJourneys = journeysByEpicId.get(epic.id) ?? [];
+    for (const { journeyKey, journey } of epicJourneys) {
+      const journeyRes = await clickupRequest<{ id: string }>(`/list/${listId}/task`, {
         method: 'POST',
-        body: { name: epic.title, content: epic.description ?? '' },
+        body: {
+          name: journey.title,
+          description: journeyDescription(journey),
+          parent: epicTaskId,
+          tags: [epic.domain, 'journey'],
+        },
         projectId: project.id,
         apiKey,
       });
-      if (!res.ok || !res.data?.id) {
-        // Fallback: ClickUp says "name taken" but our pre-fetch missed it
-        // (race condition or eventual consistency). Re-fetch the folder's
-        // lists — both live and archived — find ours by name, adopt or
-        // unarchive as needed.
-        if (res.error && /name taken/i.test(res.error)) {
-          const refresh = await clickupRequest<{ lists: Array<{ id: string; name: string }> }>(
-            `/folder/${folderId}/list`,
-            { method: 'GET', projectId: project.id, apiKey },
-          );
-          const found = refresh.data?.lists?.find((l) => l.name === epic.title);
-          if (found?.id) {
-            listId = found.id;
-            await setMapping(project.id, 'list', epic.epicKey, listId);
-            log.push({ timestamp: ts(), message: `↻ Adopted existing list "${epic.title}" (${listId}) after name conflict`, type: 'info' });
-          } else {
-            // Look in archived too — name conflict could be from a trashed list.
-            const archRefresh = await clickupRequest<{ lists: Array<{ id: string; name: string }> }>(
-              `/folder/${folderId}/list?archived=true`,
-              { method: 'GET', projectId: project.id, apiKey },
-            );
-            const archFound = archRefresh.data?.lists?.find((l) => l.name === epic.title);
-            if (archFound?.id && (await unarchiveList(archFound.id))) {
-              listId = archFound.id;
-              await setMapping(project.id, 'list', epic.epicKey, listId);
-              log.push({ timestamp: ts(), message: `↻ Restored archived list "${epic.title}" (${listId}) after name conflict`, type: 'info' });
-            }
-          }
-        }
-        if (!listId) {
-          log.push({ timestamp: ts(), message: `✗ Failed to create list for epic "${epic.title}": ${res.error}`, type: 'error' });
+      if (!journeyRes.ok || !journeyRes.data?.id) {
+        log.push({ timestamp: ts(), message: `   ✗ Journey "${journey.title}": ${journeyRes.error}`, type: 'error' });
+        errorCount++;
+        continue;
+      }
+      const journeyTaskId = journeyRes.data.id;
+      await setMapping(project.id, 'task', journeyKey, journeyTaskId);
+      log.push({ timestamp: ts(), message: `   ✓ Journey: ${journey.title}`, type: 'success' });
+
+      // 3. Tasks under this journey — sub-subtasks (parent = journey task)
+      const journeyTasks = taskByJourneyId.get(journey.id) ?? [];
+      for (const { taskKey, task } of journeyTasks) {
+        const taskRes = await clickupRequest<{ id: string }>(`/list/${listId}/task`, {
+          method: 'POST',
+          body: {
+            name: `[${task.wbsId}] ${task.title}`,
+            description: taskDescription(task),
+            parent: journeyTaskId,
+            time_estimate: Math.round(task.estimateHours * 60 * 60 * 1000),
+            tags: [task.domain],
+          },
+          projectId: project.id,
+          wbsId: task.wbsId,
+          apiKey,
+        });
+        if (!taskRes.ok || !taskRes.data?.id) {
+          log.push({ timestamp: ts(), message: `      ✗ Task [${task.wbsId}]: ${taskRes.error}`, type: 'error' });
           errorCount++;
           continue;
         }
-      } else {
-        listId = res.data.id;
-        await setMapping(project.id, 'list', epic.epicKey, listId);
-        log.push({ timestamp: ts(), message: `✓ Created list "${epic.title}" (${listId})`, type: 'success' });
+        await setMapping(project.id, 'task', taskKey, taskRes.data.id);
+        log.push({ timestamp: ts(), message: `      ✓ Task: [${task.wbsId}] ${task.title}`, type: 'success' });
+        syncedCount++;
       }
-    } else {
-      log.push({ timestamp: ts(), message: `Reusing list for "${epic.title}" (${listId})`, type: 'info' });
-    }
-    listIdByEpicId.set(epicId, listId);
-  }
-
-  // ─── 3. Create only the unsynced tasks ──────────────────────────────────
-  for (const { taskKey, task } of unsynced) {
-    const listId = listIdByEpicId.get(task.epicId);
-    if (!listId) {
-      log.push({ timestamp: ts(), message: `✗ Skipping task ${task.wbsId}: no list for epic`, type: 'error' });
-      errorCount++;
-      continue;
-    }
-
-    const body = {
-      name: `[${task.wbsId}] ${task.title}`,
-      description: taskDescription(task),
-      time_estimate: Math.round(task.estimateHours * 60 * 60 * 1000),
-      tags: [task.domain],
-    };
-
-    const res = await clickupRequest<{ id: string }>(`/list/${listId}/task`, {
-      method: 'POST',
-      body,
-      projectId: project.id,
-      wbsId: task.wbsId,
-      apiKey,
-    });
-    if (res.ok && res.data?.id) {
-      await setMapping(project.id, 'task', taskKey, res.data.id);
-      log.push({ timestamp: ts(), message: `✓ Created [${task.wbsId}] ${task.title}`, type: 'success' });
-      syncedCount++;
-    } else {
-      log.push({ timestamp: ts(), message: `✗ Failed to create [${task.wbsId}]: ${res.error}`, type: 'error' });
-      errorCount++;
     }
   }
 
-  // ─── 5. Done ────────────────────────────────────────────────────────────
+  // ─── Done ───────────────────────────────────────────────────────────────
   if (errorCount === 0) {
-    log.push({ timestamp: ts(), message: `Sync complete. ${syncedCount} task(s) pushed to ClickUp.`, type: 'success' });
+    log.push({
+      timestamp: ts(),
+      message: `Sync complete. ${syncedCount} task(s) pushed under ${epicsToCreate.length} epic(s) and ${journeysWithApprovedTasks.length} journey(s).`,
+      type: 'success',
+    });
   } else {
-    log.push({ timestamp: ts(), message: `Sync finished with ${errorCount} error(s). ${syncedCount} task(s) succeeded.`, type: 'error' });
+    log.push({
+      timestamp: ts(),
+      message: `Sync finished with ${errorCount} error(s). ${syncedCount} task(s) succeeded.`,
+      type: 'error',
+    });
   }
 
   return { log, syncedCount, errorCount };

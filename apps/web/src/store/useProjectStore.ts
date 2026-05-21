@@ -664,12 +664,29 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     if (!trimmed) return;
     get().appendStageChat('brief', pid, { role: 'user', text: trimmed });
     set({ isBriefChatPending: true });
+
+    // Backend returns one of three shapes:
+    //   action.type === 'regenerateAll' → also has `regenerate` legacy field
+    //   action.type === 'none'          → also has `brief` (unchanged current shape)
+    //   action.type === everything else → mutating action; also has `brief` updated
+    type BriefChatResponse = {
+      reply: string;
+      action?: { type: string };
+      regenerate?: string;
+      brief?: BriefWithHistory;
+    };
+
     let regenAll: string | undefined;
     try {
       const history = (get().briefChat[pid] ?? []).slice(-8).map((m) => ({ role: m.role, text: m.text }));
-      const res = await api.post<{ reply: string; regenerate?: string }>(`/projects/${pid}/brief/chat`, { message: trimmed, history });
+      const res = await api.post<BriefChatResponse>(`/projects/${pid}/brief/chat`, { message: trimmed, history });
       get().appendStageChat('brief', pid, { role: 'agent', text: res.reply });
       regenAll = res.regenerate;
+      // If the backend already mutated the brief (anything except regenerateAll),
+      // swap the local brief state so the page refreshes without an extra fetch.
+      if (res.brief && (!res.action || res.action.type !== 'regenerateAll')) {
+        set({ brief: res.brief });
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Chat reply failed.';
       get().appendStageChat('brief', pid, { role: 'agent', text: `(Couldn't fetch a reply: ${msg})` });
@@ -691,7 +708,11 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   // ─── Definition chat ──────────────────────────────────────────────────────
-  // No mutations — agent advises on the form but the user owns the inputs.
+  // Can update a single allowed field on the project (name, client,
+  // projectType, estimatedBudget, startDate, contactPerson, rawInput).
+  // Backend persists the change and returns the updated project row; we
+  // mirror the change into the local `definition` slice so the form
+  // refreshes without a reload.
 
   chatAboutDefinition: async (message) => {
     const pid = get().activeProjectId;
@@ -700,10 +721,28 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     if (!trimmed) return;
     get().appendStageChat('definition', pid, { role: 'user', text: trimmed });
     set({ isDefinitionChatPending: true });
+
+    type DefinitionChatResponse = {
+      reply: string;
+      action?:
+        | { type: 'none' }
+        | { type: 'updateField'; field: keyof ProjectDefinition; value: string };
+      project?: Record<string, unknown>;
+    };
+
     try {
       const history = (get().definitionChat[pid] ?? []).slice(-8).map((m) => ({ role: m.role, text: m.text }));
-      const res = await api.post<{ reply: string }>(`/projects/${pid}/definition/chat`, { message: trimmed, history });
+      const res = await api.post<DefinitionChatResponse>(`/projects/${pid}/definition/chat`, { message: trimmed, history });
       get().appendStageChat('definition', pid, { role: 'agent', text: res.reply });
+
+      if (res.action?.type === 'updateField') {
+        // Server-side persisted the change; mirror it locally so the form +
+        // any read-only displays update immediately.
+        const { field, value } = res.action;
+        set((state) => ({
+          definition: { ...state.definition, [field]: value },
+        }));
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Chat reply failed.';
       get().appendStageChat('definition', pid, { role: 'agent', text: `(Couldn't fetch a reply: ${msg})` });
@@ -713,7 +752,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   // ─── Sync chat ─────────────────────────────────────────────────────────────
-  // Discussion-only — actual sync still triggered by the Sync button on the page.
+  // Can answer questions OR trigger the sync / reset the sync log. The actual
+  // ClickUp work is still done by the existing startSync() flow — we just
+  // dispatch to it here when the LLM returns action.type === 'triggerSync'.
 
   chatAboutSync: async (message) => {
     const pid = get().activeProjectId;
@@ -722,15 +763,39 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     if (!trimmed) return;
     get().appendStageChat('sync', pid, { role: 'user', text: trimmed });
     set({ isSyncChatPending: true });
+
+    type SyncChatResponse = {
+      reply: string;
+      action?: { type: 'none' | 'triggerSync' | 'resetSync' };
+    };
+
+    let pendingAction: 'triggerSync' | 'resetSync' | null = null;
     try {
       const history = (get().syncChat[pid] ?? []).slice(-8).map((m) => ({ role: m.role, text: m.text }));
-      const res = await api.post<{ reply: string }>(`/projects/${pid}/sync/chat`, { message: trimmed, history });
+      const res = await api.post<SyncChatResponse>(`/projects/${pid}/sync/chat`, { message: trimmed, history });
       get().appendStageChat('sync', pid, { role: 'agent', text: res.reply });
+      if (res.action?.type === 'triggerSync' || res.action?.type === 'resetSync') {
+        pendingAction = res.action.type;
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Chat reply failed.';
       get().appendStageChat('sync', pid, { role: 'agent', text: `(Couldn't fetch a reply: ${msg})` });
     } finally {
       set({ isSyncChatPending: false });
+    }
+
+    // Run the sync action AFTER the chat reply has been appended so the
+    // user sees the assistant's narration first, then the side effect.
+    if (pendingAction === 'triggerSync') {
+      try {
+        await get().startSync(pid);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Sync failed.';
+        get().appendStageChat('sync', pid, { role: 'agent', text: `Sync failed: ${msg}` });
+      }
+    } else if (pendingAction === 'resetSync') {
+      get().resetSync();
+      get().appendStageChat('sync', pid, { role: 'agent', text: 'Local sync log cleared. Click Sync to push approved tasks again.' });
     }
   },
 
@@ -1265,22 +1330,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         set((state) => ({
           regenState: { ...state.regenState, affectedIds: ['brief'], diffSummary: 'Brief regenerated' },
         }));
-        // If downstream stages exist, offer to cascade-regenerate them so they
-        // reflect the new brief content. Without this, the brief drifts out of
-        // sync with epics/journeys/tasks until the user manually regens each.
-        const epicsCount = get().epics.length;
-        const journeysCount = get().journeys.length;
-        const tasksCount = get().tasks.length;
-        if (epicsCount + journeysCount + tasksCount > 0) {
-          set({
-            cascadePrompt: {
-              open: true,
-              challengeText: text,
-              counts: { epics: epicsCount, journeys: journeysCount, tasks: tasksCount },
-              runningStage: null,
-            },
-          });
-        }
+        // Cascade-prompt is now triggered inside generateBrief() itself so the
+        // dialog fires regardless of which entry point ran the regen (button,
+        // chat, etc.). No additional work needed here.
       } else if (stage === 'epics') {
         await get().generateEpics(pid, text);
         const after = get().epics;
@@ -1619,6 +1671,26 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         challengeText: challengeText ?? '',
       });
       set({ brief: res });
+
+      // Offer to cascade-regenerate downstream stages whenever the brief is
+      // re-extracted AND there's already something to cascade through. This
+      // lives here (not in challengeAI) so the prompt fires regardless of
+      // which entry point ran the regen — the Brief page's Regenerate button,
+      // the chat's "rebuild the brief" action, or anything else that calls
+      // generateBrief.
+      const epicsCount = get().epics.length;
+      const journeysCount = get().journeys.length;
+      const tasksCount = get().tasks.length;
+      if (epicsCount + journeysCount + tasksCount > 0) {
+        set({
+          cascadePrompt: {
+            open: true,
+            challengeText: challengeText ?? '',
+            counts: { epics: epicsCount, journeys: journeysCount, tasks: tasksCount },
+            runningStage: null,
+          },
+        });
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to generate brief.';
       set({ appError: `Brief generation failed: ${msg}` });

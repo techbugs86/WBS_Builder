@@ -167,6 +167,37 @@ CREATE TABLE IF NOT EXISTS sync_log (
   INDEX idx_created (created_at)
 );
 
+-- ─── Regeneration audit log ──────────────────────────────────────────────────
+-- Captures one row per generate / regenerate call for epics, journeys, tasks.
+-- The chat module looks up the most recent event for the current stage so
+-- the assistant can answer "what changed?" with concrete add / remove lists
+-- pulled from this row's summary JSON.
+
+CREATE TABLE IF NOT EXISTS regen_events (
+  id VARCHAR(36) PRIMARY KEY,
+  project_id VARCHAR(36) NOT NULL,
+  stage ENUM('brief','epics','journeys','tasks') NOT NULL,
+  summary JSON NOT NULL,
+  instruction TEXT,
+  before_count INT NOT NULL DEFAULT 0,
+  after_count INT NOT NULL DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_project_stage_time (project_id, stage, created_at)
+);
+
+-- If regen_events existed from an earlier migration with the smaller enum
+-- (only epics/journeys/tasks), widen it to include 'brief'.
+SET @enum_has_brief = (
+  SELECT COUNT(*) FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'regen_events' AND COLUMN_NAME = 'stage'
+    AND COLUMN_TYPE LIKE '%brief%'
+);
+SET @sql = IF(@enum_has_brief = 0,
+  "ALTER TABLE regen_events MODIFY COLUMN stage ENUM('brief','epics','journeys','tasks') NOT NULL",
+  'SELECT 1'
+);
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
 -- ─── Document attachments for project intake ─────────────────────────────────
 -- Adds attachments_text (concatenated extracted text from all uploaded docs;
 -- fed alongside raw_input into generateBrief / previewProject) and the

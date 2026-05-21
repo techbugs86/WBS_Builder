@@ -432,6 +432,7 @@ export async function chatAboutEpics(
   epics: Epic[],
   userMessage: string,
   history: { role: 'user' | 'agent'; text: string }[],
+  regenContext = '',
 ): Promise<EpicChatResult> {
   if (!hasKey(provider)) {
     return {
@@ -516,41 +517,38 @@ WRITING reply:
 - Tone: friendly, professional, no marketing fluff.
 - Never invent epics not in the list when discussing or removing. For addOne, the new epic is fine.
 
-RENDERING COMPARISONS AND LISTS:
-- DO NOT use tables (no markdown pipes, no Unicode box-drawing grids). The narrow sidebar mangles them and most users find them hard to scan.
-- INSTEAD, render comparisons as labeled sections, grouped by the type of change. This is the only format used for diffs / comparisons / "show me X vs Y":
+RENDERING COMPARISONS AND DIFFS ("what changed?", "compare to before", etc.):
 
-Example for an epic comparison reply:
+This output is read in a NARROW chat panel (~360px wide). Every extra word hurts readability. Stick to this exact compact format — TITLES ONLY, NUMBERED LISTS, NO PER-ITEM DESCRIPTIONS:
 
-Here's how the new lineup compares to what you had before:
+EXACT FORMAT (copy this template):
 
-✓ UNCHANGED (5)
-  • User Authentication & Registration
-  • QR Code Scanning for Points Accrual
-  • Toast POS System Integration
-  • User Profile and Points History
-  • Rewards Redemption System
+5 epics before → 6 epics now
+1 added · 0 removed · 5 unchanged
 
-★ NEW (1)
-  • Loyalty Program Analytics — gathers insights from user engagement and redemption patterns
+ADDED (1)
+1. Loyalty Program Analytics
 
-~ MODIFIED (2)
-  • Manager Dashboard — added refund-volume metric and top-earner widget
-  • Push Notifications — scope tightened to in-app only
+UNCHANGED (5)
+1. User Authentication & Registration
+2. QR Code Scanning for Points Accrual
+3. Toast POS System Integration
+4. User Profile and Points History
+5. Rewards Redemption System
 
-× REMOVED (1)
-  • Search (consolidated into Profile)
-
-Rules for this format:
-- Use the exact symbols ✓ ★ ~ × in the section headers as shown.
-- ALWAYS include the count in parentheses after the section name.
-- Skip sections that are empty (don't write "✓ UNCHANGED (0)" — just omit the section entirely).
-- Use a bullet (•) with two leading spaces for every item.
-- For NEW and MODIFIED items, append a short "—" dash followed by 1 sentence of context. UNCHANGED and REMOVED items can be title-only unless extra context aids the user.
-- One blank line between sections.
-- Pull previous-state context from the conversation transcript above when the user references "original", "previous", "before". If the transcript doesn't show the previous state, say so honestly and offer to recap the current list instead.
+RULES — follow strictly:
+- Plain UPPERCASE word headers: ADDED, REMOVED, UNCHANGED. No symbols, no emoji, no markdown.
+- Each item is EXACTLY ONE LINE — just the title. NO em-dash, NO description, NO "consolidated into X", NO marketing sentence. Title-only. Always.
+- Numbered (1., 2., 3.) within each section so the user can reference items in follow-up.
+- Skip empty sections entirely (no "REMOVED (0)").
+- Top summary line gives counts. Second line gives the deltas separated by " · ".
+- Section order: ADDED first, then REMOVED, then UNCHANGED last.
+- One blank line between sections, no extra preamble like "Here's how the new lineup compares…". Go straight to the summary line.
 - Keep titles intact — do not truncate.
 
+If the user explicitly asks "why was X removed?" or "what's special about Y?", answer that ONE question in a follow-up turn with normal prose — do NOT pad every diff item with reasoning by default.
+
+${regenContext}${GENERAL_CONVERSATION_POLICY}
 PROJECT BRIEF SUMMARY:
 ${(brief.summary ?? '').slice(0, 600)}
 
@@ -630,6 +628,7 @@ function genericChatSystemPrompt(
   brief: Brief,
   itemsCompact: string,
   extraContext = '',
+  regenContext = '',
 ): string {
   return `You are a product-management assistant helping a PM review the ${stageLabel} for "${brief.title || brief.client}". You are AGENTIC with FIVE possible actions. You NEVER refuse to act.
 
@@ -668,9 +667,29 @@ WRITING reply:
 - For action turns: short confirmation naming the target.
 - NEVER say "I can't" — you CAN, by picking the right action.
 
-RENDERING COMPARISONS:
-- NEVER use tables. Use labeled sections: ✓ UNCHANGED (n), ★ NEW (n), ~ MODIFIED (n), × REMOVED (n). Bullets (•) two-space-indented. Skip empty sections.
+RENDERING COMPARISONS AND DIFFS ("what changed?", "compare to before"):
+- Output is read in a NARROW chat panel. Compact numbered lists only — NO tables, NO emoji, NO per-item descriptions.
+- EXACT format (copy template):
 
+5 ${itemNoun}s before → 6 ${itemNoun}s now
+1 added · 0 removed · 5 unchanged
+
+ADDED (1)
+1. <title only>
+
+UNCHANGED (5)
+1. <title only>
+2. <title only>
+...
+
+RULES:
+- Plain UPPERCASE headers: ADDED, REMOVED, UNCHANGED. No symbols, no emoji.
+- ONE LINE per item — title only. Never append " — <description>" or " (consolidated into X)".
+- Numbered within each section. Skip empty sections.
+- Section order: ADDED, REMOVED, UNCHANGED.
+- No preamble like "Here's how the lineup compares" — go straight to the summary line.
+
+${regenContext}${GENERAL_CONVERSATION_POLICY}
 PROJECT BRIEF SUMMARY:
 ${(brief.summary ?? '').slice(0, 500)}
 
@@ -723,6 +742,7 @@ export async function chatAboutJourneys(
   journeys: Journey[],
   userMessage: string,
   history: { role: 'user' | 'agent'; text: string }[],
+  regenContext = '',
 ): Promise<JourneyChatResult> {
   if (!hasKey(provider)) {
     return { reply: `(${provider === 'openai' ? 'OpenAI' : 'Anthropic'} key not configured.) Set it in Admin → Integrations and try again.` };
@@ -735,6 +755,7 @@ export async function chatAboutJourneys(
     brief,
     journeysCompact,
     `RELATED EPICS (for context — do not modify):\n${epicTitles || '(no epics)'}`,
+    regenContext,
   );
   const transcript = history.slice(-8).map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`).join('\n\n');
   const userBlock = transcript ? `Recent conversation:\n${transcript}\n\nUser's new message: ${userMessage}` : userMessage;
@@ -750,6 +771,7 @@ export async function chatAboutTasks(
   tasks: Record<string, unknown>[],
   userMessage: string,
   history: { role: 'user' | 'agent'; text: string }[],
+  regenContext = '',
 ): Promise<TaskChatResult> {
   if (!hasKey(provider)) {
     return { reply: `(${provider === 'openai' ? 'OpenAI' : 'Anthropic'} key not configured.) Set it in Admin → Integrations and try again.` };
@@ -764,6 +786,7 @@ export async function chatAboutTasks(
     brief,
     tasksCompact,
     `RELATED JOURNEYS (top 8 for context):\n${journeyContext || '(no journeys)'}\n\nTasks have a "wbs_id" custom field for ClickUp sync. Acceptance criteria must follow Given/When/Then format with type ∈ {functional, non-functional, technical}.`,
+    regenContext,
   );
   const transcript = history.slice(-8).map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`).join('\n\n');
   const userBlock = transcript ? `Recent conversation:\n${transcript}\n\nUser's new message: ${userMessage}` : userMessage;
@@ -1026,22 +1049,111 @@ function defaultStageFallback(stage: 'epics' | 'journeys' | 'tasks' | 'sync', pr
   }
 }
 
+/**
+ * Shared "conversation vs. action" policy injected into every page's chat
+ * system prompt. The intent:
+ *  - The assistant ALWAYS answers general questions naturally — methodology,
+ *    terminology, recommendations, even tangential / off-topic chat.
+ *  - SCOPE LOCK applies only to mutating ACTIONS, not to conversation. If the
+ *    user asks the assistant to *perform* something that doesn't belong to
+ *    this page, it sets action.type = "none" and replies with a brief
+ *    redirect to the correct page.
+ *
+ * Place this block AFTER the action-type catalogue in each page's system
+ * prompt so the LLM has already seen its action vocabulary.
+ */
+const GENERAL_CONVERSATION_POLICY = `GENERAL CONVERSATION POLICY:
+
+You are also a helpful conversational assistant. ANSWER ANY GENERAL QUESTION naturally — methodology (agile, WBS, brief extraction), tool questions (ClickUp, Postgres), terminology (what is an epic vs a journey vs a task), recommendations, advice, even small talk. Be friendly, concise, and direct. 1-4 sentences unless the user explicitly asks for detail.
+
+You may always:
+- Explain concepts ("What's the difference between in-scope and out-of-scope?")
+- Recommend approaches ("How should I structure this assumption?")
+- Comment on what's currently shown on this page
+- Compare or summarize content on this page
+
+OFF-PAGE ACTION REQUESTS — REDIRECT, don't refuse:
+When the user asks you to PERFORM something that doesn't belong to this page, set "action": { "type": "none" } and write a friendly redirect in the reply. Name the correct page.
+
+Examples (apply the spirit, not the wording):
+- On Brief page, "generate epics" → none + "Generating epics happens on the Epics page (Step 3). Once you're done reviewing the brief, head there and the chat can drive the generation."
+- On Definition page, "rewrite the brief summary" → none + "The brief lives on Step 2 (Project Brief). Open that page and the chat there can rewrite the summary for you."
+- On Sync page, "remove a task" → none + "Tasks are edited on the Tasks page (Step 5). I can't change task content from the Sync chat — head there to make edits, then come back to sync."
+- On Epics page, "answer open question 2" → none + "Open questions live on the Brief (Step 2). The chat there can mark questions answered."
+- On Journeys page, "regenerate the brief" → none + "Brief regeneration is on Step 2. The chat there can rebuild it from your raw input + attachments."
+- On Tasks page, "add an assumption" → none + "Assumptions live on the Brief. Open Step 2 and the chat there can add it."
+
+If the user asks a GENERAL/INFORMATIONAL question that touches another page's content (e.g. on the Sync page asking "how many epics do we have?"), you can ANSWER it (the data isn't fully visible to you, but give your best read from context) — what you can't do is mutate other pages' data from here.
+
+Off-topic / non-WBS questions (e.g. "what's a good name for a dog?"): answer briefly and pleasantly. You're not locked to project topics.
+
+`;
+
 // ─── Brief / Definition / Sync chat helpers ──────────────────────────────────
 
+/**
+ * Discriminated union of actions the Brief-page chat can request.
+ * The LLM picks ONE of these based on the user's message; the route handler
+ * dispatches each to the matching DB mutation. `none` is the default —
+ * the assistant chats without changing anything.
+ */
+export type BriefAction =
+  | { type: 'none' }
+  | { type: 'regenerateAll'; instruction: string }
+  | { type: 'addAssumption'; text: string }
+  | { type: 'removeAssumption'; index: number }
+  | { type: 'rewriteAssumption'; index: number; text: string }
+  | { type: 'addOpenQuestion'; text: string }
+  | { type: 'removeOpenQuestion'; index: number }
+  | { type: 'answerOpenQuestion'; index: number; answer: string }
+  | { type: 'addScopeItem'; text: string; kind: 'in' | 'out' }
+  | { type: 'removeScopeItem'; index: number; kind: 'in' | 'out' }
+  | { type: 'rewriteSummary'; text: string };
+
+export type DefinitionFieldKey =
+  | 'name'
+  | 'client'
+  | 'projectType'
+  | 'estimatedBudget'
+  | 'startDate'
+  | 'contactPerson'
+  | 'rawInput';
+
+export type DefinitionAction =
+  | { type: 'none' }
+  | { type: 'updateField'; field: DefinitionFieldKey; value: string };
+
+export type SyncAction =
+  | { type: 'none' }
+  | { type: 'triggerSync' }
+  | { type: 'resetSync' };
+
+export interface BriefChatResult { reply: string; action: BriefAction; }
+export interface DefinitionChatResult { reply: string; action: DefinitionAction; }
+export interface SyncChatResult { reply: string; action: SyncAction; }
+
+/** Legacy shape — kept for callers that haven't migrated to the rich action union. */
 export interface SimpleChatResult {
   reply: string;
   regenerate?: string;
 }
 
-async function callTextChat(
+/**
+ * Shared chat invocation. Parses the LLM's `reply` + raw `action` object and
+ * hands the action back as a plain object — the caller is responsible for
+ * validating/casting it into its page-scoped action union.
+ */
+async function callRichTextChat(
   provider: 'anthropic' | 'openai',
   systemPrompt: string,
   userMessage: string,
   history: { role: 'user' | 'agent'; text: string }[],
-  parseRegenerate = false,
-): Promise<SimpleChatResult> {
+): Promise<{ reply: string; rawAction: Record<string, unknown> }> {
   if (!hasKey(provider)) {
-    return { reply: `(${provider === 'openai' ? 'OpenAI' : 'Anthropic'} key not configured.) Set it in Admin → Integrations.` };
+    return {
+      reply: `(${provider === 'openai' ? 'OpenAI' : 'Anthropic'} key not configured.) Set it in Admin → Integrations.`,
+      rawAction: { type: 'none' },
+    };
   }
   const transcript = history.slice(-8).map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.text}`).join('\n\n');
   const userBlock = transcript ? `Recent conversation:\n${transcript}\n\nUser's new message: ${userMessage}` : userMessage;
@@ -1055,52 +1167,127 @@ async function callTextChat(
   const reply = typeof parsed.reply === 'string' && parsed.reply.trim()
     ? parsed.reply.trim()
     : "(I didn't get a clear response — try rephrasing.)";
+  const rawAction = (parsed.action && typeof parsed.action === 'object')
+    ? parsed.action as Record<string, unknown>
+    : { type: 'none' };
+  return { reply, rawAction };
+}
+
+/**
+ * Legacy thin wrapper kept so we don't break callers that still expect
+ * `{ reply, regenerate? }`. Internally it now uses callRichTextChat.
+ */
+async function callTextChat(
+  provider: 'anthropic' | 'openai',
+  systemPrompt: string,
+  userMessage: string,
+  history: { role: 'user' | 'agent'; text: string }[],
+  parseRegenerate = false,
+): Promise<SimpleChatResult> {
+  const { reply, rawAction } = await callRichTextChat(provider, systemPrompt, userMessage, history);
   if (parseRegenerate) {
-    const action = parsed.action as { type?: string; instruction?: string } | undefined;
-    if (action && action.type === 'regenerateAll' && typeof action.instruction === 'string' && action.instruction.trim()) {
-      return { reply, regenerate: action.instruction.trim() };
+    if (rawAction['type'] === 'regenerateAll' && typeof rawAction['instruction'] === 'string' && (rawAction['instruction'] as string).trim()) {
+      return { reply, regenerate: (rawAction['instruction'] as string).trim() };
     }
   }
   return { reply };
 }
 
-/** Chat about the project brief — can trigger a full brief regen. */
+/** Chat about the project brief — answers questions OR executes one of 10
+ *  scoped actions (regenerate, edit assumptions/questions/scope, rewrite
+ *  summary). Strictly scoped to the Brief page — cannot affect Epics, Tasks,
+ *  or any other entity. */
 export async function chatAboutBrief(
   provider: 'anthropic' | 'openai',
   brief: Brief,
   userMessage: string,
   history: { role: 'user' | 'agent'; text: string }[],
-): Promise<SimpleChatResult> {
+  regenContext = '',
+): Promise<BriefChatResult> {
   const openQ = (brief.openQuestions ?? []).filter((q) => q.status === 'open').slice(0, 8).map((q, i) => `${i + 1}. ${q.text}`).join('\n');
   const assumptionsList = (brief.assumptions ?? []).slice(0, 10).map((a, i) => `${i + 1}. ${a.text}`).join('\n');
   const inScopeList = (brief.inScope ?? []).slice(0, 12).map((s, i) => `${i + 1}. ${s}`).join('\n');
   const outScopeList = (brief.outOfScope ?? []).slice(0, 12).map((s, i) => `${i + 1}. ${s}`).join('\n');
 
-  const systemPrompt = `You are a PM assistant helping review the brief for "${brief.title || brief.client}". You can chat OR trigger a full brief regeneration. You NEVER refuse to act.
+  const systemPrompt = `You are a PM assistant helping review the brief for "${brief.title || brief.client}". You can chat OR perform ONE scoped action on the brief. You NEVER refuse to act.
 
-Respond with valid JSON:
+SCOPE LOCK — BRIEF PAGE ONLY: every action you take MUST stay inside the brief (summary, assumptions, open questions, scope items). Never propose changes to epics, journeys, tasks, or project setup fields — those belong to other pages.
+
+Respond with valid JSON of the shape:
 {
-  "reply": "string — your conversational response, 1-4 sentences (longer for comparisons or lists). Plain text, no markdown.",
-  "action": {
-    "type": "none" | "regenerateAll",
-    "instruction": "string (required for regenerateAll — self-contained instruction for the brief regenerator)"
-  }
+  "reply": "string — your conversational response, 1-4 sentences. Plain text, no markdown.",
+  "action": { "type": "none" | "regenerateAll" | "addAssumption" | "removeAssumption" | "rewriteAssumption" | "addOpenQuestion" | "removeOpenQuestion" | "answerOpenQuestion" | "addScopeItem" | "removeScopeItem" | "rewriteSummary", ...action-specific fields below }
 }
 
-USE "regenerateAll" when the user asks for:
-- "rewrite the brief", "regenerate the brief", "redo the summary", "tighten the scope"
-- ANY ask to materially change the brief content.
-- The instruction string must be self-contained — the regenerator has no memory of this chat.
+ACTION SHAPES (use exactly the fields named):
+- { "type": "none" }                                         → just chat, no DB change
+- { "type": "regenerateAll", "instruction": "..." }          → full brief regen with the given guidance
+- { "type": "addAssumption", "text": "..." }                 → append a new assumption
+- { "type": "removeAssumption", "index": <1-based> }         → delete assumption at that index
+- { "type": "rewriteAssumption", "index": <1-based>, "text": "..." } → replace assumption text
+- { "type": "addOpenQuestion", "text": "..." }               → append a new OPEN question
+- { "type": "removeOpenQuestion", "index": <1-based> }       → delete an open question (index in the OPEN list shown below)
+- { "type": "answerOpenQuestion", "index": <1-based>, "answer": "..." } → mark question answered with text
+- { "type": "addScopeItem", "text": "...", "kind": "in" | "out" } → append an in-scope or out-of-scope item
+- { "type": "removeScopeItem", "index": <1-based>, "kind": "in" | "out" } → delete a scope item
+- { "type": "rewriteSummary", "text": "..." }                → replace the brief summary verbatim
 
-USE "none" for:
-- Questions about brief content ("what's in scope?", "why is X an assumption?")
-- Discussion of open questions, assumptions, scope items.
-- Explanations without change.
+PICKING THE RIGHT ACTION:
+- "Rewrite the brief" / "redo it" / broad rewrite → regenerateAll
+- "Tighten / rewrite the summary" → rewriteSummary
+- "Add assumption X" → addAssumption with text=X
+- "Remove assumption 2" / "drop the third assumption" → removeAssumption with the 1-based index
+- "Rewrite assumption 1 to say Y" → rewriteAssumption
+- "Add open question X" → addOpenQuestion
+- "Mark question 2 answered: Z" / "answer 2: we'll use Postgres" → answerOpenQuestion
+- "Remove the open question about X" → removeOpenQuestion (figure out the index from the list)
+- "Add X to in scope" → addScopeItem kind:"in"
+- "Move X out of scope" / "X is out of scope" → addScopeItem kind:"out"  (the user is adding to out-of-scope, not removing)
+- "Remove X from scope" → removeScopeItem kind:"in" (if X is currently in-scope)
+- Pure question / discussion → none
 
-CRITICAL: "reply" is the ONLY user-visible output. Put any explanations, comparisons, or lists IN THAT FIELD.
+CRITICAL: "reply" is the ONLY user-visible text. The action runs silently — describe what you did in the reply.
 
-For comparisons / multi-item lists: use labeled sections (✓ ★ ~ ×) with bullets. Never use markdown tables.
+RENDERING REGEN DIFFS — MATCH REPLY LENGTH TO QUESTION SCOPE:
 
+The user reads this in a narrow chat panel. NEVER dump the entire diff unless the user explicitly asks for "everything" / "all of it" / "the full diff". Pick the SHORTEST reply that answers the question.
+
+ABSOLUTE RULES when quoting prior content:
+- NEVER truncate with "..." or "…". Quote the FULL TEXT verbatim from the data block.
+- NEVER add evaluative commentary like "the new version is more focused" or "this is clearer". Just show what was asked for.
+- NEVER include the current/after version unless the user explicitly asked to compare.
+
+PATTERNS:
+
+(1) "What was the previous summary?" / "show the v(N-1) summary" / "what was it before?"
+    → Reply with ONLY the verbatim previous summary. Two lines:
+      Previous summary (v12):
+      "<the FULL previous summary text, verbatim, no truncation, no ellipsis>"
+
+(2) "What changed in the summary?" / "compare the summary"
+    → Two blocks, each FULL VERBATIM text, no editorial:
+      Before:
+      "<full previous summary>"
+
+      After:
+      "<full current summary>"
+
+(3) "What's new in scope?" / "what assumptions did it add?" / etc.
+    → Only the Added list for that ONE section. Up to 5 items + "+N more".
+
+(4) "What was removed?"
+    → Only the Removed lines across sections.
+
+(5) "What changed?" / "compare before vs now" (BROAD question — no specific target)
+    → Single-line counter, no item lists. Offer drill-down:
+      Brief regenerated. Summary rewritten · 10 in-scope added · 6 assumptions added · 6 open questions added · 4 out-of-scope added. (Ask me about a specific section for details.)
+
+(6) "Show me everything that changed" / "complete diff" / "all the changes in detail"
+    → Then and ONLY then show the full structured per-section view.
+
+When you DO show structured sections (case 6 only): plain UPPERCASE headers (IN-SCOPE, ASSUMPTIONS, etc.), numbered items, title-text only — never append "—" + a description. Cap at 5 items per section + "+N more".
+
+${regenContext}${GENERAL_CONVERSATION_POLICY}
 CURRENT BRIEF:
 Title: ${brief.title || '(untitled)'}
 Client: ${brief.client || '(unknown)'}
@@ -1108,45 +1295,103 @@ Client: ${brief.client || '(unknown)'}
 Summary:
 ${(brief.summary ?? '').slice(0, 800)}
 
-Open questions:
+Open questions (only OPEN ones — indices below):
 ${openQ || '(none)'}
 
-Assumptions:
+Assumptions (indices below):
 ${assumptionsList || '(none)'}
 
-In scope:
+In scope (indices below):
 ${inScopeList || '(none)'}
 
-Out of scope:
+Out of scope (indices below):
 ${outScopeList || '(none)'}
 `;
-  return callTextChat(provider, systemPrompt, userMessage, history, true);
+
+  const { reply, rawAction } = await callRichTextChat(provider, systemPrompt, userMessage, history);
+  const action = validateBriefAction(rawAction);
+  return { reply, action };
 }
 
-/** Chat about the project definition form — no DB mutations. */
+/** Coerces the LLM-returned `action` object into the BriefAction union or
+ *  falls back to `{ type: 'none' }` when it doesn't match a known shape. */
+function validateBriefAction(raw: Record<string, unknown>): BriefAction {
+  const type = raw['type'];
+  const text = typeof raw['text'] === 'string' ? (raw['text'] as string).trim() : '';
+  const answer = typeof raw['answer'] === 'string' ? (raw['answer'] as string).trim() : '';
+  const instruction = typeof raw['instruction'] === 'string' ? (raw['instruction'] as string).trim() : '';
+  const index = typeof raw['index'] === 'number' ? (raw['index'] as number) : Number(raw['index']);
+  const kind = raw['kind'] === 'out' ? 'out' : raw['kind'] === 'in' ? 'in' : null;
+
+  switch (type) {
+    case 'regenerateAll':
+      return instruction ? { type: 'regenerateAll', instruction } : { type: 'none' };
+    case 'addAssumption':
+      return text ? { type: 'addAssumption', text } : { type: 'none' };
+    case 'removeAssumption':
+      return Number.isFinite(index) && index > 0 ? { type: 'removeAssumption', index } : { type: 'none' };
+    case 'rewriteAssumption':
+      return Number.isFinite(index) && index > 0 && text ? { type: 'rewriteAssumption', index, text } : { type: 'none' };
+    case 'addOpenQuestion':
+      return text ? { type: 'addOpenQuestion', text } : { type: 'none' };
+    case 'removeOpenQuestion':
+      return Number.isFinite(index) && index > 0 ? { type: 'removeOpenQuestion', index } : { type: 'none' };
+    case 'answerOpenQuestion':
+      return Number.isFinite(index) && index > 0 && answer ? { type: 'answerOpenQuestion', index, answer } : { type: 'none' };
+    case 'addScopeItem':
+      return text && kind ? { type: 'addScopeItem', text, kind } : { type: 'none' };
+    case 'removeScopeItem':
+      return Number.isFinite(index) && index > 0 && kind ? { type: 'removeScopeItem', index, kind } : { type: 'none' };
+    case 'rewriteSummary':
+      return text ? { type: 'rewriteSummary', text } : { type: 'none' };
+    default:
+      return { type: 'none' };
+  }
+}
+
+/** Chat about the project definition form. Can answer questions OR update
+ *  exactly ONE field on the project row (name / client / projectType /
+ *  estimatedBudget / startDate / contactPerson / rawInput). Strictly scoped
+ *  to the Definition page — cannot touch brief, epics, or downstream stages. */
 export async function chatAboutDefinition(
   provider: 'anthropic' | 'openai',
   project: { name: string; client: string; project_type: string; estimated_budget: string; start_date: string; raw_input: string; contact_person: string },
   userMessage: string,
   history: { role: 'user' | 'agent'; text: string }[],
-): Promise<SimpleChatResult> {
-  const systemPrompt = `You are a PM assistant helping refine a project setup form. You CANNOT modify the form — you advise only. The user owns their inputs.
+): Promise<DefinitionChatResult> {
+  const systemPrompt = `You are a PM assistant for the project setup form. You can chat OR update exactly ONE field on the form. You NEVER refuse to act.
 
-Respond with valid JSON:
-{ "reply": "string — your conversational response, 1-4 sentences (longer when explaining or summarizing). Plain text, no markdown." }
+SCOPE LOCK — DEFINITION PAGE ONLY: any update you make MUST be one of the allowed fields below. Never touch brief / epics / journeys / tasks / sync — those belong to other pages.
 
-You can:
-- Explain what a field means.
-- Suggest improved wording for the Raw Client Input.
-- Spot missing context the PM might want to capture.
-- Estimate timeline or scope based on what's in the form.
-- Recommend communication channels or contact rhythm.
+Respond with valid JSON of the shape:
+{
+  "reply": "string — your conversational response, 1-4 sentences. Plain text, no markdown.",
+  "action": { "type": "none" | "updateField", "field": "<one of: name, client, projectType, estimatedBudget, startDate, contactPerson, rawInput>", "value": "string" }
+}
 
-You cannot:
-- Edit the form (refer the user to the field directly).
-- Promise outcomes — frame everything as a recommendation.
+ALLOWED FIELD VALUES:
+- name: free text (project name)
+- client: free text (client / company name)
+- projectType: ONE of "web_app" | "mobile" | "api" | "automation" | "general"
+- estimatedBudget: free text (e.g. "$50,000", "USD 25k")
+- startDate: ISO date string YYYY-MM-DD
+- contactPerson: free text (person's name)
+- rawInput: free text (the original client/BD notes; replaces the entire textarea)
 
-PROJECT DEFINITION:
+PICKING THE RIGHT ACTION:
+- "Change the project name to FreshFork" → updateField field:"name" value:"FreshFork"
+- "Set client to Acme Corp" → updateField field:"client" value:"Acme Corp"
+- "Set the budget to 50k" → updateField field:"estimatedBudget" value:"$50,000"
+- "Start date: 2026-06-01" → updateField field:"startDate" value:"2026-06-01"
+- "Contact is Sarah Johnson" → updateField field:"contactPerson" value:"Sarah Johnson"
+- "Change project type to mobile" → updateField field:"projectType" value:"mobile"
+- "Replace the raw input with this paragraph: ..." → updateField field:"rawInput" value:"..."
+- Pure question / advice (e.g. "what does projectType=automation mean?") → none
+
+CRITICAL: "reply" is the ONLY user-visible text. After an update succeeds, briefly confirm what you changed.
+
+${GENERAL_CONVERSATION_POLICY}
+CURRENT PROJECT SETUP:
 Name: ${project.name || '(empty)'}
 Client: ${project.client || '(empty)'}
 Project type: ${project.project_type || '(empty)'}
@@ -1157,31 +1402,63 @@ Contact person: ${project.contact_person || '(empty)'}
 Raw client input (truncated):
 ${(project.raw_input ?? '').slice(0, 1500)}
 `;
-  return callTextChat(provider, systemPrompt, userMessage, history, false);
+  const { reply, rawAction } = await callRichTextChat(provider, systemPrompt, userMessage, history);
+  const action = validateDefinitionAction(rawAction);
+  return { reply, action };
 }
 
-/** Chat about ClickUp sync — read-only advisory. */
+const ALLOWED_DEFINITION_FIELDS: ReadonlySet<DefinitionFieldKey> = new Set([
+  'name', 'client', 'projectType', 'estimatedBudget', 'startDate', 'contactPerson', 'rawInput',
+]);
+
+const ALLOWED_PROJECT_TYPES = new Set(['web_app', 'mobile', 'api', 'automation', 'general']);
+
+function validateDefinitionAction(raw: Record<string, unknown>): DefinitionAction {
+  if (raw['type'] !== 'updateField') return { type: 'none' };
+  const field = raw['field'];
+  const value = raw['value'];
+  if (typeof field !== 'string' || typeof value !== 'string') return { type: 'none' };
+  if (!ALLOWED_DEFINITION_FIELDS.has(field as DefinitionFieldKey)) return { type: 'none' };
+  const trimmed = value.trim();
+  if (!trimmed) return { type: 'none' };
+  // Extra guard: projectType must be one of the enum values; otherwise the
+  // patch would either be silently ignored or 400 from validation.
+  if (field === 'projectType' && !ALLOWED_PROJECT_TYPES.has(trimmed)) return { type: 'none' };
+  return { type: 'updateField', field: field as DefinitionFieldKey, value: trimmed };
+}
+
+/** Chat about ClickUp sync. Can answer questions OR trigger a sync /
+ *  reset the local sync state. Strictly scoped to the Sync page — no
+ *  brief / epic / task mutations possible from here. */
 export async function chatAboutSync(
   provider: 'anthropic' | 'openai',
   syncSummary: { projectName: string; taskCount: number; syncedCount: number; lastSyncedAt: string | null; recentErrors: string[] },
   userMessage: string,
   history: { role: 'user' | 'agent'; text: string }[],
-): Promise<SimpleChatResult> {
-  const systemPrompt = `You are a PM assistant helping interpret ClickUp sync status. You CANNOT trigger sync from chat — the user uses the Sync button on the page. You advise only.
+): Promise<SyncChatResult> {
+  const systemPrompt = `You are a PM assistant on the ClickUp sync page. You can chat OR perform ONE scoped sync action. You NEVER refuse to act.
 
-Respond with valid JSON:
-{ "reply": "string — your conversational response, 1-4 sentences. Plain text, no markdown." }
+SCOPE LOCK — SYNC PAGE ONLY: you can only trigger a sync or reset the local sync log. Never propose changes to brief / epics / journeys / tasks — those belong to other pages.
 
-You can:
-- Explain what the sync numbers mean.
-- Diagnose common errors ("List deleted" → list was removed in ClickUp UI, our mapping is stale; "Folder name taken" → another folder exists with the same project name).
-- Recommend next steps ("click Sync to retry", "check Admin → Integrations for your ClickUp API key").
-- Summarize what's been pushed vs what's pending.
+Respond with valid JSON of the shape:
+{
+  "reply": "string — your conversational response, 1-4 sentences. Plain text, no markdown.",
+  "action": { "type": "none" | "triggerSync" | "resetSync" }
+}
 
-You cannot:
-- Actually run a sync.
-- Modify mappings.
+ACTION SHAPES:
+- { "type": "none" }         → just chat, no side effect
+- { "type": "triggerSync" }  → start pushing approved tasks to ClickUp now
+- { "type": "resetSync" }    → clear the local sync log + progress (does NOT undo what's already in ClickUp)
 
+PICKING THE RIGHT ACTION:
+- "Sync now" / "push to ClickUp" / "start the sync" / "send the tasks" → triggerSync
+- "Reset the sync log" / "clear the log so I can retry" / "wipe the sync state" → resetSync
+- Questions ("why did this fail?", "what's pending?") / explanations → none
+
+CRITICAL: "reply" is the ONLY user-visible text. The action runs after — describe what you did or are about to do in the reply.
+
+${GENERAL_CONVERSATION_POLICY}
 SYNC STATE:
 Project: ${syncSummary.projectName}
 Total tasks: ${syncSummary.taskCount}
@@ -1190,7 +1467,16 @@ Last sync: ${syncSummary.lastSyncedAt || 'never'}
 Recent errors:
 ${syncSummary.recentErrors.length > 0 ? syncSummary.recentErrors.slice(0, 5).join('\n') : '(none)'}
 `;
-  return callTextChat(provider, systemPrompt, userMessage, history, false);
+  const { reply, rawAction } = await callRichTextChat(provider, systemPrompt, userMessage, history);
+  const action = validateSyncAction(rawAction);
+  return { reply, action };
+}
+
+function validateSyncAction(raw: Record<string, unknown>): SyncAction {
+  const type = raw['type'];
+  if (type === 'triggerSync') return { type: 'triggerSync' };
+  if (type === 'resetSync') return { type: 'resetSync' };
+  return { type: 'none' };
 }
 
 /** Generate exactly ONE new task to append. */
@@ -1475,7 +1761,24 @@ export async function generateEpics(
   const raw = await callLLM(provider, systemPrompt + EPICS_SCHEMA_DESC, userMessage, 'epics');
   const parsed = JSON.parse(raw);
   const arr = Array.isArray(parsed) ? parsed : parsed.epics ?? parsed.items ?? [];
-  return arr.map((e: Record<string, unknown>) => EpicSchema.parse({ id: uuid(), status: 'pending', ...e }));
+  // Per-epic validation (see generateEpicsForTier for rationale — one bad
+  // epic must not kill the whole batch).
+  const out: Epic[] = [];
+  for (const rawEpic of arr) {
+    if (!rawEpic || typeof rawEpic !== 'object') continue;
+    const e = rawEpic as Record<string, unknown>;
+    const result = EpicSchema.safeParse({
+      id: uuid(),
+      status: 'pending',
+      ...e,
+      domain: coerceEpicDomain(e['domain']),
+      description: typeof e['description'] === 'string' ? e['description'] : '',
+      storyPoints: e['storyPoints'] ?? 5,
+    });
+    if (result.success) out.push(result.data);
+    else console.warn('[generateEpics] dropped one epic:', result.error.issues.slice(0, 3).map((iss) => `${iss.path.join('.')}: ${iss.message}`));
+  }
+  return out;
 }
 
 /**
@@ -1522,7 +1825,63 @@ Return ONLY the new epics for this tier as a JSON array (or object with key "epi
   const raw = await callLLM(provider, tierPrompt, userMessage, 'epics');
   const parsed = JSON.parse(raw);
   const arr = Array.isArray(parsed) ? parsed : parsed.epics ?? parsed.items ?? [];
-  return arr.map((e: Record<string, unknown>) => EpicSchema.parse({ id: uuid(), status: 'pending', ...e }));
+
+  // Validate each epic INDIVIDUALLY. The earlier code used a strict .parse()
+  // inside .map(), which meant a single bad epic (e.g. domain="engineering"
+  // when the schema only allows 7 enum values) threw and killed the entire
+  // tier — that's why a regen would sometimes return 3, 6, or 9 epics
+  // instead of all 8 (one tier failed = -3; two failed = -6).
+  //
+  // We now:
+  //   1. Pre-coerce shape (default id, status, salvage invalid domain).
+  //   2. safeParse per-epic; on failure, log the issue and skip ONLY that one.
+  // Result: a single LLM hiccup in one tier costs you ONE epic, not THREE.
+  const validated: Epic[] = [];
+  for (const rawEpic of arr) {
+    if (!rawEpic || typeof rawEpic !== 'object') continue;
+    const e = rawEpic as Record<string, unknown>;
+    const result = EpicSchema.safeParse({
+      id: uuid(),
+      status: 'pending',
+      ...e,
+      // Salvage an unknown domain (very common LLM failure) by mapping it
+      // to 'profile' (the most-generic catch-all). The PM can re-tag via
+      // chat/edit if needed; better than losing the epic entirely.
+      domain: coerceEpicDomain(e['domain']),
+      // Description sometimes comes back as null when the LLM truncates —
+      // give it an empty string so the schema doesn't reject it.
+      description: typeof e['description'] === 'string' ? e['description'] : '',
+      // storyPoints is z.coerce.number() so string is fine, but null isn't.
+      storyPoints: e['storyPoints'] ?? 5,
+    });
+    if (result.success) {
+      validated.push(result.data);
+    } else {
+      console.warn(`[generateEpicsForTier] tier=${tier} dropped one epic — validation failed:`, {
+        title: e['title'],
+        domain: e['domain'],
+        issues: result.error.issues.slice(0, 3).map((iss) => `${iss.path.join('.')}: ${iss.message}`),
+      });
+    }
+  }
+  return validated;
+}
+
+/** Maps an LLM-returned domain value onto one of the 7 valid enum entries.
+ *  Falls back to 'profile' (the most generic catch-all) when nothing matches. */
+function coerceEpicDomain(raw: unknown): 'auth' | 'billing' | 'search' | 'messaging' | 'profile' | 'admin' | 'notifications' {
+  if (typeof raw !== 'string') return 'profile';
+  const v = raw.toLowerCase().trim();
+  const allowed = ['auth', 'billing', 'search', 'messaging', 'profile', 'admin', 'notifications'] as const;
+  if ((allowed as readonly string[]).includes(v)) return v as (typeof allowed)[number];
+  // Common aliases the LLM produces — map to the closest valid bucket.
+  if (/^(authent|identity|account|user|login|signup|signin|oauth|sso)/.test(v)) return 'auth';
+  if (/^(pay|bill|invoic|checkout|subscript|stripe|paypal|transact)/.test(v)) return 'billing';
+  if (/^(search|discover|catalog|browse|filter)/.test(v)) return 'search';
+  if (/^(chat|messag|comment|inbox|conversation)/.test(v)) return 'messaging';
+  if (/^(notif|push|sms|email|alert)/.test(v)) return 'notifications';
+  if (/^(admin|dashboard|manag|moderation|setting|reporting|audit)/.test(v)) return 'admin';
+  return 'profile';
 }
 
 /**
@@ -1600,8 +1959,19 @@ ${(brief.summary ?? '').slice(0, 600)}`;
     throw new Error('AI returned an unexpected shape when generating the new epic. Try rephrasing.');
   }
 
+  // Salvage common LLM failure modes (invalid domain, null description) the
+  // same way generateEpicsForTier does, so chat "add a new epic" succeeds
+  // even when the model picks an out-of-enum domain.
+  const c = candidate as Record<string, unknown>;
   try {
-    return EpicSchema.parse({ id: uuid(), status: 'pending', ...(candidate as Record<string, unknown>) });
+    return EpicSchema.parse({
+      id: uuid(),
+      status: 'pending',
+      ...c,
+      domain: coerceEpicDomain(c['domain']),
+      description: typeof c['description'] === 'string' ? c['description'] : '',
+      storyPoints: c['storyPoints'] ?? 5,
+    });
   } catch (err) {
     console.error('[generateOneEpic] Zod validation failed. Candidate:', JSON.stringify(candidate).slice(0, 500), 'Error:', err);
     throw new Error('AI produced an epic with missing or invalid fields. Try a more specific instruction.');
