@@ -1,5 +1,9 @@
 import mysql from 'mysql2/promise';
 
+// TiDB Cloud / managed MySQL hosts require TLS. Local MySQL on Windows
+// usually doesn't. Set DB_SSL=true in production env to enable TLS.
+const useSsl = (process.env['DB_SSL'] ?? '').toLowerCase() === 'true';
+
 const pool = mysql.createPool({
   host: process.env['DB_HOST'] ?? 'localhost',
   port: parseInt(process.env['DB_PORT'] ?? '3306', 10),
@@ -9,6 +13,7 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
   timezone: '+00:00',
+  ...(useSsl ? { ssl: { minVersion: 'TLSv1.2' as const, rejectUnauthorized: true } } : {}),
 });
 
 // Accept anything mysql2 can serialize. Includes Express's `string | string[]`

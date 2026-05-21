@@ -51,6 +51,9 @@ export async function runMigrations(): Promise<void> {
     );
   }
 
+  // Mirror the SSL toggle from db/index.ts so migrations work against TiDB Cloud.
+  const useSsl = (process.env['DB_SSL'] ?? '').toLowerCase() === 'true';
+
   const connection = await mysql.createConnection({
     host: dbHost,
     port: dbPort,
@@ -58,6 +61,7 @@ export async function runMigrations(): Promise<void> {
     password: dbPass,
     database: dbName,
     multipleStatements: true,
+    ...(useSsl ? { ssl: { minVersion: 'TLSv1.2' as const, rejectUnauthorized: true } } : {}),
   });
 
   try {
