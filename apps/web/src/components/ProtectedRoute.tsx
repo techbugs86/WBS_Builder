@@ -1,7 +1,7 @@
 import { Navigate, Outlet } from 'react-router-dom';
 import { useProjectStore } from '../store/useProjectStore';
 
-const ROLE_RANK: Record<string, number> = { owner: 3, admin: 2, pm: 1 };
+const ROLE_RANK: Record<string, number> = { owner: 3, admin: 3, pm: 3 };
 
 export function ProtectedRoute({ requiredRole }: { requiredRole?: 'owner' | 'admin' | 'pm' }) {
   const currentUser = useProjectStore((s) => s.currentUser);
